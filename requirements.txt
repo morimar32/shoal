@@ -1,0 +1,12 @@
+# shoal dependencies
+fastapi
+uvicorn
+pydantic
+
+# lagoon - install from sibling directory until published:
+#   pip install -e ../lagoon
+# (not listed here because it's not on PyPI yet)
+
+# corpus download script (scripts/download_corpus.py)
+requests
+html2text

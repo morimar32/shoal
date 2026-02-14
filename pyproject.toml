@@ -1,0 +1,27 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "shoal"
+version = "0.1.0"
+description = "Retrieval engine built on lagoon — structured SQL-based retrieval over semantic reef scores"
+requires-python = ">=3.10"
+license = "MIT"
+dependencies = [
+    "lagoon",
+]
+
+[project.scripts]
+shoal = "shoal._cli:main"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/shoal"]
