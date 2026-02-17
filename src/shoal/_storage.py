@@ -8,7 +8,7 @@ import math
 import sqlite3
 from pathlib import Path
 
-from ._models import ChunkData, SearchResult, SectionData, SharedReef
+from ._models import ChunkData, SearchResult, SectionData, SharedReef, WordObservation
 
 # Default number of reefs to keep per chunk after IDF-sorted filtering.
 # Reefs are sorted by z_score * idf (selectivity), and only the top K
@@ -130,6 +130,13 @@ CREATE TABLE IF NOT EXISTS word_observations (
     context_reefs TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_word_observations_word ON word_observations(word);
+
+CREATE TABLE IF NOT EXISTS chunk_custom_words (
+    chunk_id        INTEGER NOT NULL REFERENCES chunks(id) ON DELETE CASCADE,
+    custom_word_id  INTEGER NOT NULL REFERENCES custom_words(id) ON DELETE CASCADE,
+    PRIMARY KEY (chunk_id, custom_word_id)
+);
+CREATE INDEX IF NOT EXISTS idx_ccw_custom_word_id ON chunk_custom_words(custom_word_id);
 """
 
 
@@ -602,3 +609,221 @@ class Storage:
         # Sort by contribution (chunk_z * query_z) descending
         shared.sort(key=lambda s: s.chunk_z * s.query_z, reverse=True)
         return shared
+
+    # ── Word observations ──
+
+    def insert_word_observations(self, observations: list[WordObservation]) -> None:
+        """Bulk insert Pass 1 word observations."""
+        self.conn.executemany(
+            "INSERT INTO word_observations (word, document_id, sentence_idx, context_reefs) "
+            "VALUES (?, ?, ?, ?)",
+            [
+                (obs.word, obs.document_id, obs.sentence_idx, json.dumps(obs.context_reefs))
+                for obs in observations
+            ],
+        )
+        self.conn.commit()
+
+    def get_word_observations_for_document(self, doc_id: int) -> dict[str, list[list[dict]]]:
+        """Get word observations grouped by word for a document.
+
+        Returns {word: [context_reefs_list, ...]} where each entry is
+        the context_reefs from one observation.
+        """
+        rows = self.conn.execute(
+            "SELECT word, context_reefs FROM word_observations "
+            "WHERE document_id = ? ORDER BY word, sentence_idx",
+            (doc_id,),
+        ).fetchall()
+
+        grouped: dict[str, list[list[dict]]] = {}
+        for row in rows:
+            word = row["word"]
+            reefs = json.loads(row["context_reefs"])
+            grouped.setdefault(word, []).append(reefs)
+        return grouped
+
+    # ── Custom words ──
+
+    def insert_custom_word(
+        self,
+        word: str,
+        word_hash: int,
+        word_id: int,
+        specificity: int,
+        idf_q: int,
+        n_occurrences: int,
+        reef_entries: list[tuple[int, int, float]],
+    ) -> int:
+        """Insert or update a custom word and its reef associations.
+
+        reef_entries: [(reef_id, bm25_q, association_strength), ...]
+        Returns the custom_words.id (autoincrement).
+        """
+        # Delete old reef associations first (before changing word_id via upsert)
+        existing = self.conn.execute(
+            "SELECT word_id FROM custom_words WHERE word = ?", (word,)
+        ).fetchone()
+        if existing:
+            self.conn.execute(
+                "DELETE FROM custom_word_reefs WHERE word_id = ?",
+                (existing["word_id"],),
+            )
+
+        self.conn.execute(
+            "INSERT INTO custom_words (word, word_hash, word_id, specificity, idf_q, n_occurrences) "
+            "VALUES (?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(word) DO UPDATE SET "
+            "word_id = excluded.word_id, specificity = excluded.specificity, "
+            "idf_q = excluded.idf_q, n_occurrences = excluded.n_occurrences, "
+            "updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')",
+            (word, word_hash, word_id, specificity, idf_q, n_occurrences),
+        )
+
+        # Get the id (works for both insert and update)
+        row = self.conn.execute(
+            "SELECT id FROM custom_words WHERE word = ?", (word,)
+        ).fetchone()
+        cw_id = row["id"]
+
+        # Insert new reef associations
+        for reef_id, bm25_q, strength in reef_entries:
+            self.conn.execute(
+                "INSERT INTO custom_word_reefs (word_id, reef_id, bm25_q, association_strength) "
+                "VALUES (?, ?, ?, ?)",
+                (word_id, reef_id, bm25_q, strength),
+            )
+        self.conn.commit()
+        return cw_id
+
+    def load_custom_vocabulary(self) -> list[dict]:
+        """Load all custom words with their reef associations for startup injection."""
+        words = self.conn.execute(
+            "SELECT id, word, word_hash, word_id, specificity, idf_q, n_occurrences "
+            "FROM custom_words ORDER BY id"
+        ).fetchall()
+
+        result = []
+        for w in words:
+            reefs = self.conn.execute(
+                "SELECT reef_id, association_strength FROM custom_word_reefs WHERE word_id = ?",
+                (w["word_id"],),
+            ).fetchall()
+            result.append({
+                "id": w["id"],
+                "word": w["word"],
+                "word_hash": w["word_hash"],
+                "word_id": w["word_id"],
+                "specificity": w["specificity"],
+                "idf_q": w["idf_q"],
+                "n_occurrences": w["n_occurrences"],
+                "reef_associations": [(r["reef_id"], r["association_strength"]) for r in reefs],
+            })
+        return result
+
+    # ── Chunk custom words ──
+
+    def insert_chunk_custom_words(self, chunk_id: int, custom_word_ids: list[int]) -> None:
+        """Record which custom words appear in a chunk."""
+        if not custom_word_ids:
+            return
+        self.conn.executemany(
+            "INSERT OR IGNORE INTO chunk_custom_words (chunk_id, custom_word_id) VALUES (?, ?)",
+            [(chunk_id, cw_id) for cw_id in custom_word_ids],
+        )
+        self.conn.commit()
+
+    def get_chunks_by_custom_words(
+        self, custom_word_ids: list[int], *, limit: int = 50
+    ) -> list[int]:
+        """Get chunk IDs containing any given custom word, ordered by match count desc."""
+        if not custom_word_ids:
+            return []
+        placeholders = ", ".join(["?"] * len(custom_word_ids))
+        rows = self.conn.execute(
+            f"SELECT chunk_id, COUNT(*) AS n_matches "
+            f"FROM chunk_custom_words "
+            f"WHERE custom_word_id IN ({placeholders}) "
+            f"GROUP BY chunk_id ORDER BY n_matches DESC LIMIT ?",
+            [*custom_word_ids, limit],
+        ).fetchall()
+        return [row["chunk_id"] for row in rows]
+
+    def score_chunks_by_reef_overlap(
+        self,
+        chunk_ids: list[int],
+        query_reefs: list[tuple[int, float]],
+    ) -> list[SearchResult]:
+        """Score specific chunks by reef overlap (used by lightning rod).
+
+        Same scoring formula as search_by_reef_overlap but pre-filtered
+        to the given chunk IDs.
+        """
+        if not chunk_ids or not query_reefs:
+            return []
+
+        # Build query reef CTE
+        value_placeholders = ", ".join(["(?, ?)"] * len(query_reefs))
+        params: list = []
+        for reef_id, z_score in query_reefs:
+            params.extend([reef_id, z_score])
+
+        # Build chunk_id filter
+        chunk_placeholders = ", ".join(["?"] * len(chunk_ids))
+        params.extend(chunk_ids)
+
+        sql = f"""
+        WITH qr(reef_id, query_z) AS (VALUES {value_placeholders})
+        SELECT c.id, c.text, c.document_id, d.title AS document_title,
+               c.section_id, s.title AS section_title,
+               c.chunk_index, c.start_char, c.end_char,
+               c.confidence, c.coverage, c.top_reef_name,
+               c.arch_score_0, c.arch_score_1, c.arch_score_2, c.arch_score_3, c.arch_score_4,
+               c.reef_l2_norm,
+               CASE WHEN c.reef_l2_norm > 0
+                    THEN SUM(cr.z_score * qr.query_z) * sqrt(COUNT(cr.reef_id)) / c.reef_l2_norm
+                    ELSE 0.0
+               END AS match_score,
+               COUNT(cr.reef_id) AS n_shared_reefs
+        FROM chunks c
+        JOIN chunk_reefs cr ON c.id = cr.chunk_id
+        JOIN qr ON cr.reef_id = qr.reef_id
+        JOIN documents d ON c.document_id = d.id
+        JOIN sections s ON c.section_id = s.id
+        WHERE c.id IN ({chunk_placeholders})
+        GROUP BY c.id
+        ORDER BY match_score DESC
+        """
+
+        rows = self.conn.execute(sql, params).fetchall()
+
+        results = []
+        for row in rows:
+            section_path = self.get_section_path(row["section_id"])
+            results.append(SearchResult(
+                text=row["text"],
+                match_score=row["match_score"],
+                n_shared_reefs=row["n_shared_reefs"],
+                document_id=row["document_id"],
+                document_title=row["document_title"],
+                chunk_index=row["chunk_index"],
+                start_char=row["start_char"],
+                end_char=row["end_char"],
+                confidence=row["confidence"],
+                coverage=row["coverage"],
+                top_reef_name=row["top_reef_name"],
+                chunk_id=row["id"],
+                section_title=row["section_title"],
+                section_path=section_path,
+                arch_scores=[
+                    row["arch_score_0"], row["arch_score_1"],
+                    row["arch_score_2"], row["arch_score_3"],
+                    row["arch_score_4"],
+                ],
+            ))
+        return results
+
+    def count_custom_words(self) -> int:
+        """Count the number of custom words in the vocabulary."""
+        row = self.conn.execute("SELECT COUNT(*) AS n FROM custom_words").fetchone()
+        return row["n"]

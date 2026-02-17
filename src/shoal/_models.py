@@ -93,6 +93,7 @@ class QueryInfo:
     total_words: int
     top_reefs: list[dict]  # [{"reef_name": str, "z_score": float}, ...]
     top_islands: list[dict] = field(default_factory=list)  # [{"island_name": str, "aggregate_z": float}, ...]
+    tagged_words: list[dict] = field(default_factory=list)  # [{"word_id": int, "tag": int}]
 
 
 @dataclass(slots=True)
@@ -103,6 +104,15 @@ class SearchResponse:
 
 
 @dataclass(slots=True)
+class WordObservation:
+    """An observation of an unknown word in context during Pass 1."""
+    word: str
+    document_id: int
+    sentence_idx: int
+    context_reefs: list[dict]  # [{"reef_id": int, "z_score": float, "weight": float}]
+
+
+@dataclass(slots=True)
 class IngestResult:
     """Result of ingesting a document."""
     id: int
@@ -110,3 +120,5 @@ class IngestResult:
     n_chunks: int
     n_sections: int
     tags: list[str]
+    n_new_words: int = 0
+    two_pass: bool = False

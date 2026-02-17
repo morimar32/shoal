@@ -1,4 +1,4 @@
-"""Ingestion pipeline for shoal (Phase 1 — single pass, no vocabulary extension)."""
+"""Two-pass ingestion with vocabulary extension."""
 
 from __future__ import annotations
 
@@ -8,9 +8,10 @@ from typing import TYPE_CHECKING
 from ._models import ChunkData, DocFormat, IngestResult, SectionData
 from ._parsers import parse_sections
 from ._storage import Storage
+from ._vocab import build_vocabulary, collect_word_observations, get_custom_word_ids_for_chunk
 
 if TYPE_CHECKING:
-    from lagoon import ReefScorer
+    from lagoon import DocumentAnalysis, ReefScorer
 
 
 def ingest_document(
@@ -32,10 +33,16 @@ def ingest_document(
     min_section_length: int = 200,
     min_reef_z: float = 2.0,
     reef_top_k: int = 38,
+    enable_vocab_extension: bool = True,
+    confidence_threshold: float = 1.5,
+    association_z_threshold: float = 0.5,
 ) -> IngestResult:
     """Ingest a document: parse sections, analyze with lagoon, store in SQLite.
 
-    Phase 1 implementation: single pass (no vocabulary extension).
+    When enable_vocab_extension is True, uses a two-pass pipeline:
+    - Pass 1: Analyze to discover unknown words and collect reef context
+    - Vocabulary build: Create custom words from observations
+    - Pass 2: Re-analyze with extended vocabulary (only if new words found)
     """
     # 1. Insert document record
     doc_id = storage.insert_document(
@@ -70,36 +77,127 @@ def ingest_document(
     # 4. Insert section tree
     section_ids = storage.insert_sections(doc_id, sections)
 
-    # 5. Analyze each section and build chunks
+    # 5. Compute total word count for vocabulary threshold
+    total_word_count = sum(
+        len(s.analysis_text.split()) for s in sections
+    )
+
+    # 6. Analyze sections and build chunks
     all_chunks: list[ChunkData] = []
-    chunk_index = 0
+    chunk_custom_word_map: dict[int, list[int]] = {}  # chunk_index -> [custom_word_ids]
+    n_new_words = 0
+    two_pass = False
 
-    for sec_idx, section in enumerate(sections):
-        section_chunks = _analyze_section(
-            scorer=scorer,
-            section=section,
-            section_index=sec_idx,
-            chunk_index_start=chunk_index,
-            sensitivity=sensitivity,
-            smooth_window=smooth_window,
-            min_chunk_sentences=min_chunk_sentences,
-            max_chunk_sentences=max_chunk_sentences,
-            min_reef_z=min_reef_z,
+    analyze_kwargs = dict(
+        sensitivity=sensitivity,
+        smooth_window=smooth_window,
+        min_chunk_sentences=min_chunk_sentences,
+        max_chunk_sentences=max_chunk_sentences,
+        min_reef_z=min_reef_z,
+    )
+
+    if enable_vocab_extension:
+        # PASS 1: Analyze and collect word observations
+        pass1_analyses: list[tuple[int, DocumentAnalysis]] = []
+        all_observations = []
+
+        for sec_idx, section in enumerate(sections):
+            text = section.analysis_text
+            if not text.strip():
+                continue
+            analysis = scorer.analyze(text, **analyze_kwargs)
+            pass1_analyses.append((sec_idx, analysis))
+            observations = collect_word_observations(
+                scorer, analysis, doc_id,
+                confidence_threshold=confidence_threshold,
+            )
+            all_observations.extend(observations)
+
+        # Store observations
+        if all_observations:
+            storage.insert_word_observations(all_observations)
+
+        # VOCABULARY BUILD
+        n_new_words = build_vocabulary(
+            scorer, storage, doc_id, total_word_count,
+            association_z_threshold=association_z_threshold,
         )
-        all_chunks.extend(section_chunks)
-        chunk_index += len(section_chunks)
 
-    # 6. Filter out tiny chunks that lack meaningful reef signal
+        if n_new_words > 0:
+            # PASS 2: Re-analyze with extended vocabulary
+            two_pass = True
+            chunk_index = 0
+            for sec_idx, section in enumerate(sections):
+                section_chunks, cw_map = _analyze_section_pass2(
+                    scorer=scorer,
+                    section=section,
+                    section_index=sec_idx,
+                    chunk_index_start=chunk_index,
+                    **analyze_kwargs,
+                )
+                all_chunks.extend(section_chunks)
+                # Offset cw_map keys by chunk_index_start
+                for ci, cw_ids in cw_map.items():
+                    chunk_custom_word_map[chunk_index + ci] = cw_ids
+                chunk_index += len(section_chunks)
+        else:
+            # No new words — reuse Pass 1 analyses
+            chunk_index = 0
+            for sec_idx, analysis in pass1_analyses:
+                section_chunks = _chunks_from_analysis(
+                    analysis, sections[sec_idx], sec_idx, chunk_index,
+                )
+                all_chunks.extend(section_chunks)
+                chunk_index += len(section_chunks)
+    else:
+        # Single-pass: unchanged Phase 1 path
+        chunk_index = 0
+        for sec_idx, section in enumerate(sections):
+            section_chunks = _analyze_section(
+                scorer=scorer,
+                section=section,
+                section_index=sec_idx,
+                chunk_index_start=chunk_index,
+                **analyze_kwargs,
+            )
+            all_chunks.extend(section_chunks)
+            chunk_index += len(section_chunks)
+
+    # 7. Filter out tiny chunks
     if min_chunk_chars > 0:
-        all_chunks = [c for c in all_chunks if len(c.text) >= min_chunk_chars]
-        for i, chunk in enumerate(all_chunks):
-            chunk.chunk_index = i
+        filtered: list[ChunkData] = []
+        old_to_new: dict[int, int] = {}
+        for chunk in all_chunks:
+            if len(chunk.text) >= min_chunk_chars:
+                old_idx = chunk.chunk_index
+                chunk.chunk_index = len(filtered)
+                old_to_new[old_idx] = chunk.chunk_index
+                filtered.append(chunk)
+        all_chunks = filtered
 
-    # 7. Store chunks
+        # Remap chunk_custom_word_map
+        remapped: dict[int, list[int]] = {}
+        for old_idx, cw_ids in chunk_custom_word_map.items():
+            if old_idx in old_to_new:
+                remapped[old_to_new[old_idx]] = cw_ids
+        chunk_custom_word_map = remapped
+
+    # 8. Store chunks
+    chunk_ids: list[int] = []
     if all_chunks:
-        storage.insert_chunks(doc_id, all_chunks, section_ids=section_ids, reef_top_k=reef_top_k)
+        chunk_ids = storage.insert_chunks(
+            doc_id, all_chunks, section_ids=section_ids, reef_top_k=reef_top_k,
+        )
 
-    # 8. Update section chunk counts
+    # 9. Record chunk custom words (if Pass 2 was run)
+    if two_pass and chunk_ids:
+        for i, db_chunk_id in enumerate(chunk_ids):
+            chunk_idx = all_chunks[i].chunk_index
+            cw_ids = chunk_custom_word_map.get(chunk_idx, [])
+            if cw_ids:
+                storage.insert_chunk_custom_words(db_chunk_id, cw_ids)
+
+    # 10. Update section chunk counts
     chunk_counts: Counter[int] = Counter()
     for chunk in all_chunks:
         chunk_counts[chunk.section_index] += 1
@@ -112,6 +210,8 @@ def ingest_document(
         n_chunks=len(all_chunks),
         n_sections=len(sections),
         tags=tag_list,
+        n_new_words=n_new_words,
+        two_pass=two_pass,
     )
 
 
@@ -140,15 +240,85 @@ def _analyze_section(
         min_reef_z=min_reef_z,
     )
 
+    return _build_chunks_from_segments(analysis, section, section_index, chunk_index_start)
+
+
+def _analyze_section_pass2(
+    scorer: ReefScorer,
+    section: SectionData,
+    section_index: int,
+    chunk_index_start: int,
+    sensitivity: float,
+    smooth_window: int,
+    min_chunk_sentences: int,
+    max_chunk_sentences: int,
+    min_reef_z: float = 2.0,
+) -> tuple[list[ChunkData], dict[int, list[int]]]:
+    """Analyze a section (Pass 2) and track custom word IDs per chunk.
+
+    Returns (chunks, {chunk_local_index: [custom_word_ids]}).
+    The custom_word_ids are custom_words.id values (tags), not runtime word_ids.
+    """
+    text = section.analysis_text
+    if not text.strip():
+        return [], {}
+
+    analysis = scorer.analyze(
+        text,
+        sensitivity=sensitivity,
+        smooth_window=smooth_window,
+        min_chunk_sentences=min_chunk_sentences,
+        max_chunk_sentences=max_chunk_sentences,
+        min_reef_z=min_reef_z,
+    )
+
+    chunks = _build_chunks_from_segments(analysis, section, section_index, chunk_index_start)
+
+    # Track custom words per chunk
+    cw_map: dict[int, list[int]] = {}
+    for seg_idx, segment in enumerate(analysis.segments):
+        # Collect all matched_word_ids from segment topic + sentence results
+        all_word_ids: set[int] = set(segment.topic.matched_word_ids)
+        for sent_result in segment.sentence_results:
+            all_word_ids.update(sent_result.matched_word_ids)
+
+        tagged = get_custom_word_ids_for_chunk(scorer, frozenset(all_word_ids))
+        if tagged:
+            # Values are custom_words.id (the tags)
+            cw_map[seg_idx] = list(set(tagged.values()))
+
+    return chunks, cw_map
+
+
+def _chunks_from_analysis(
+    analysis: DocumentAnalysis,
+    section: SectionData,
+    section_index: int,
+    chunk_index_start: int,
+) -> list[ChunkData]:
+    """Convert a saved DocumentAnalysis to ChunkData list without re-analyzing.
+
+    Used when Pass 1 analysis can be reused (no new words discovered).
+    """
+    return _build_chunks_from_segments(analysis, section, section_index, chunk_index_start)
+
+
+def _build_chunks_from_segments(
+    analysis: DocumentAnalysis,
+    section: SectionData,
+    section_index: int,
+    chunk_index_start: int,
+) -> list[ChunkData]:
+    """Build ChunkData objects from analysis segments."""
+    text = section.analysis_text
     chunks: list[ChunkData] = []
-    cursor = 0  # Track position in section text for offset computation
+    cursor = 0
 
     for seg_idx, segment in enumerate(analysis.segments):
         chunk_text = " ".join(segment.sentences)
         sentence_count = len(segment.sentences)
         topic = segment.topic
 
-        # Compute character offsets by finding sentences in section text
         start_char, end_char = _compute_offsets(
             section_text=text,
             sentences=segment.sentences,
@@ -157,15 +327,12 @@ def _analyze_section(
             section_end=len(text),
         )
 
-        # Advance cursor past this segment
         if end_char > cursor:
             cursor = end_char
 
-        # Absolute offsets relative to original document
         abs_start = section.start_char + start_char
         abs_end = section.start_char + end_char
 
-        # Extract reef data from TopicResult
         top_reefs = [
             (r.reef_id, r.name, r.z_score, r.raw_bm25, r.n_contributing_words)
             for r in topic.top_reefs

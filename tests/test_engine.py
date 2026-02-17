@@ -92,3 +92,42 @@ class TestEngine:
             format=DocFormat.markdown,
         )
         assert result.n_sections >= 2
+
+    def test_status_includes_custom_words(self, engine):
+        s = engine.status()
+        assert "n_custom_words" in s
+        assert s["n_custom_words"] == 0
+
+    def test_ingest_vocab_extension(self, engine):
+        text = (
+            "Photosynthesis converts sunlight into chemical energy in plants. "
+            "Chlorophyll pigments absorb light in the chloroplasts. "
+            "The Calvin cycle fixes carbon dioxide into glucose. "
+            "Oxygen is released as a byproduct of water splitting."
+        )
+        result = engine.ingest(
+            title="Photosynthesis",
+            content=text,
+            format=DocFormat.plaintext,
+            enable_vocab_extension=True,
+        )
+        assert result.n_chunks >= 1
+        assert isinstance(result.n_new_words, int)
+        assert isinstance(result.two_pass, bool)
+
+    def test_search_with_lightning_rod(self, engine):
+        text = (
+            "Photosynthesis converts sunlight into chemical energy in plants. "
+            "Chlorophyll pigments absorb light in the chloroplasts. "
+            "The Calvin cycle fixes carbon dioxide into glucose. "
+            "Oxygen is released as a byproduct of water splitting."
+        )
+        engine.ingest(
+            title="Photosynthesis",
+            content=text,
+            format=DocFormat.plaintext,
+        )
+        response = engine.search("photosynthesis", enable_lightning_rod=True)
+        assert isinstance(response.query_info.tagged_words, list)
+        # Response should still work regardless of lightning rod
+        assert len(response.results) > 0

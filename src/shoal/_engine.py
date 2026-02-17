@@ -96,6 +96,9 @@ class Engine:
         min_section_length: int = 200,
         min_reef_z: float = 2.0,
         reef_top_k: int = 38,
+        enable_vocab_extension: bool = True,
+        confidence_threshold: float = 1.5,
+        association_z_threshold: float = 0.5,
     ) -> IngestResult:
         """Ingest a document."""
         return ingest_document(
@@ -116,6 +119,9 @@ class Engine:
             min_section_length=min_section_length,
             min_reef_z=min_reef_z,
             reef_top_k=reef_top_k,
+            enable_vocab_extension=enable_vocab_extension,
+            confidence_threshold=confidence_threshold,
+            association_z_threshold=association_z_threshold,
         )
 
     def search(
@@ -126,6 +132,7 @@ class Engine:
         tags: list[str] | None = None,
         min_confidence: float | None = None,
         include_scores: bool = False,
+        enable_lightning_rod: bool = True,
     ) -> SearchResponse:
         """Search for relevant chunks."""
         return search(
@@ -136,6 +143,7 @@ class Engine:
             tags=tags,
             min_confidence=min_confidence,
             include_scores=include_scores,
+            enable_lightning_rod=enable_lightning_rod,
         )
 
     def delete_document(self, doc_id: int) -> bool:
@@ -226,6 +234,7 @@ class Engine:
             "n_documents": self.storage.count_documents(),
             "n_sections": self.storage.count_sections(),
             "n_chunks": self.storage.count_chunks(),
+            "n_custom_words": self.storage.count_custom_words(),
             "lagoon_version": lagoon.__version__,
             "db_path": self._db_path,
         }

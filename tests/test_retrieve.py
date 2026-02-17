@@ -115,6 +115,24 @@ class TestRetrieve:
         assert len(response.results) <= 100
 
 
+    def test_search_with_lightning_rod_disabled(self, scorer, storage):
+        self._ingest_bio_doc(scorer, storage)
+        response = search(
+            scorer, storage, "photosynthesis in plants",
+            top_k=5, enable_lightning_rod=False,
+        )
+        assert len(response.results) > 0
+        # tagged_words should be empty when lightning rod is disabled
+        assert response.query_info.tagged_words == []
+
+    def test_query_info_has_tagged_words(self, scorer, storage):
+        self._ingest_bio_doc(scorer, storage)
+        response = search(scorer, storage, "photosynthesis", top_k=5)
+        qi = response.query_info
+        # tagged_words should be a list (may be empty if no custom words match)
+        assert isinstance(qi.tagged_words, list)
+
+
 class TestStopWordDetection:
     def test_single_stop_word(self):
         assert _is_stopword_query("the") is True

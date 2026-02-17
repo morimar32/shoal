@@ -161,7 +161,11 @@ def _cmd_ingest(args: argparse.Namespace) -> None:
             tags=tags,
             source_path=str(path),
         )
-        print(f"Ingested: {result.title} ({result.n_sections} sections, {result.n_chunks} chunks, id={result.id})")
+        parts = [f"{result.n_sections} sections", f"{result.n_chunks} chunks"]
+        if result.n_new_words > 0:
+            parts.append(f"{result.n_new_words} new words")
+        suffix = " (two-pass)" if result.two_pass else ""
+        print(f"Ingested: {result.title} ({', '.join(parts)}, id={result.id}){suffix}")
 
 
 def _cmd_ingest_dir(args: argparse.Namespace) -> None:
@@ -193,7 +197,11 @@ def _cmd_ingest_dir(args: argparse.Namespace) -> None:
                 tags=tags,
                 source_path=str(path),
             )
-            print(f"  {result.title}: {result.n_sections} sections, {result.n_chunks} chunks (id={result.id})")
+            parts = [f"{result.n_sections} sections", f"{result.n_chunks} chunks"]
+            if result.n_new_words > 0:
+                parts.append(f"{result.n_new_words} new words")
+            suffix = " (two-pass)" if result.two_pass else ""
+            print(f"  {result.title}: {', '.join(parts)} (id={result.id}){suffix}")
         print(f"\nIngested {len(files)} files.")
 
 
@@ -437,6 +445,7 @@ def _cmd_status(args: argparse.Namespace) -> None:
         print(f"Documents: {s['n_documents']}")
         print(f"Sections: {s['n_sections']}")
         print(f"Chunks: {s['n_chunks']}")
+        print(f"Custom words: {s['n_custom_words']}")
         print(f"Lagoon version: {s['lagoon_version']}")
         print(f"DB path: {s['db_path']}")
 

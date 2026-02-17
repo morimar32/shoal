@@ -130,3 +130,58 @@ class TestIngest:
         sections = storage.get_sections_for_document(result.id)
         total_chunks_in_sections = sum(s["n_chunks"] for s in sections)
         assert total_chunks_in_sections == result.n_chunks
+
+    def test_ingest_with_vocab_extension_disabled(self, scorer, storage):
+        text = (
+            "The neuron transmits electrical signals through the axon. "
+            "Dendrites receive signals from neighboring neurons. "
+            "Synaptic transmission occurs at the junction between neurons. "
+            "The brain processes information through complex neural networks."
+        )
+        result = ingest_document(
+            scorer, storage,
+            title="Neurons",
+            content=text,
+            fmt=DocFormat.plaintext,
+            enable_vocab_extension=False,
+        )
+        assert result.n_chunks >= 1
+        assert result.n_new_words == 0
+        assert result.two_pass is False
+
+    def test_ingest_with_vocab_extension_enabled(self, scorer, storage):
+        text = (
+            "The neuron transmits electrical signals through the axon. "
+            "Dendrites receive signals from neighboring neurons. "
+            "Synaptic transmission occurs at the junction between neurons. "
+            "The brain processes information through complex neural networks. "
+            "Neurotransmitters carry chemical signals across synapses."
+        )
+        result = ingest_document(
+            scorer, storage,
+            title="Neural Science",
+            content=text,
+            fmt=DocFormat.plaintext,
+            enable_vocab_extension=True,
+        )
+        assert result.n_chunks >= 1
+        assert result.n_sections >= 1
+        # n_new_words may be 0 if all words are in base vocab — that's ok
+        assert result.n_new_words >= 0
+        # two_pass should be True only if new words were found
+        assert result.two_pass == (result.n_new_words > 0)
+
+    def test_ingest_result_fields(self, scorer, storage):
+        text = (
+            "Photosynthesis converts light into chemical energy. "
+            "Chlorophyll absorbs sunlight in plant chloroplasts."
+        )
+        result = ingest_document(
+            scorer, storage,
+            title="Test Fields",
+            content=text,
+            fmt=DocFormat.plaintext,
+        )
+        # Verify new fields exist and have correct types
+        assert isinstance(result.n_new_words, int)
+        assert isinstance(result.two_pass, bool)

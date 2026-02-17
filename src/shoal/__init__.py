@@ -9,6 +9,7 @@ from ._models import (
     SearchResult,
     SectionData,
     SharedReef,
+    WordObservation,
 )
 
 __version__ = "0.1.0"
@@ -23,4 +24,5 @@ __all__ = [
     "SearchResult",
     "SectionData",
     "SharedReef",
+    "WordObservation",
 ]
