@@ -50,6 +50,12 @@ WIKIPEDIA_ARTICLES = [
     "Silk Road",
     "DNA",
     "Climate change",
+    # Phase 2 stress test: "Yamamoto" disambiguation corpus
+    "Isoroku Yamamoto",
+    "Yamamoto (crater)",
+    "Ichi the Killer (manga)",
+    "Lunar craters",
+    "Manga",
 ]
 
 # Project Gutenberg books

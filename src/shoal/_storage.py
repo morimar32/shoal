@@ -343,9 +343,10 @@ class Storage:
     # ── Reef IDF ──
 
     def get_reef_idf(self) -> dict[int, float]:
-        """Compute IDF for each reef from current chunk_reefs data.
+        """Compute smoothed IDF for each reef from current chunk_reefs data.
 
-        IDF = log(N / df) where N = total chunks, df = chunks containing this reef.
+        IDF = log(1 + N / df) where N = total chunks, df = chunks containing this reef.
+        The +1 ensures non-zero IDF even in single-chunk corpora.
         Returns empty dict if no chunks exist yet (first document).
         """
         n_chunks = self.count_chunks()
@@ -355,7 +356,7 @@ class Storage:
         rows = self.conn.execute(
             "SELECT reef_id, COUNT(DISTINCT chunk_id) AS df FROM chunk_reefs GROUP BY reef_id"
         ).fetchall()
-        return {row["reef_id"]: math.log(n_chunks / row["df"]) for row in rows}
+        return {row["reef_id"]: math.log(1 + n_chunks / row["df"]) for row in rows}
 
     # ── Chunk insertion ──
 
@@ -493,34 +494,39 @@ class Storage:
         min_confidence: float | None = None,
         include_scores: bool = False,
     ) -> list[SearchResult]:
-        """Find chunks sharing query reefs, ranked by normalized reef overlap.
+        """Find chunks sharing query reefs, ranked by IDF-weighted reef overlap.
 
-        Scoring: SUM(chunk_z * query_z) * sqrt(n_shared) / reef_l2_norm
+        Scoring: SUM(chunk_z * query_z * reef_idf) * sqrt(n_shared) / reef_l2_norm
 
-        The sqrt(n_shared) factor rewards chunks sharing multiple reefs with
-        the query. Dividing by reef_l2_norm (precomputed at ingestion) normalizes
-        away text-length bias without any query-time subqueries.
+        reef_idf downweights ubiquitous reefs (appearing in many chunks) so that
+        discriminating reefs contribute more. The sqrt(n_shared) factor rewards
+        chunks sharing multiple reefs. Dividing by reef_l2_norm normalizes away
+        text-length bias.
         """
         if not query_reefs:
             return []
 
-        # Build the CTE VALUES clause for query reefs
-        value_placeholders = ", ".join(["(?, ?)"] * len(query_reefs))
+        # Compute reef IDF for query-time weighting
+        reef_idf = self.get_reef_idf()
+        default_idf = max(reef_idf.values()) * 1.5 if reef_idf else 1.0
+
+        # Build the CTE VALUES clause with IDF column
+        value_placeholders = ", ".join(["(?, ?, ?)"] * len(query_reefs))
         params: list = []
         for reef_id, z_score in query_reefs:
-            params.extend([reef_id, z_score])
+            idf = reef_idf.get(reef_id, default_idf)
+            params.extend([reef_id, z_score, idf])
 
-        # Build SQL dynamically based on filters
-        # Scoring: dot_product * sqrt(n_shared) / reef_l2_norm
+        # Scoring: IDF-weighted dot_product * sqrt(n_shared) / reef_l2_norm
         sql = f"""
-        WITH qr(reef_id, query_z) AS (VALUES {value_placeholders})
+        WITH qr(reef_id, query_z, reef_idf) AS (VALUES {value_placeholders})
         SELECT c.id, c.text, c.document_id, d.title AS document_title,
                c.section_id, s.title AS section_title,
                c.chunk_index, c.start_char, c.end_char,
                c.confidence, c.coverage, c.top_reef_name,
                c.arch_score_0, c.arch_score_1, c.arch_score_2, c.arch_score_3, c.arch_score_4,
                CASE WHEN c.reef_l2_norm > 0
-                    THEN SUM(cr.z_score * qr.query_z) * sqrt(COUNT(cr.reef_id)) / c.reef_l2_norm
+                    THEN SUM(cr.z_score * qr.query_z * qr.reef_idf) * sqrt(COUNT(cr.reef_id)) / c.reef_l2_norm
                     ELSE 0.0
                END AS match_score,
                COUNT(cr.reef_id) AS n_shared_reefs
@@ -670,6 +676,12 @@ class Storage:
                 (existing["word_id"],),
             )
 
+        # Convert u64 hash to signed i64 for SQLite INTEGER storage
+        if word_hash >= (1 << 63):
+            word_hash_signed = word_hash - (1 << 64)
+        else:
+            word_hash_signed = word_hash
+
         self.conn.execute(
             "INSERT INTO custom_words (word, word_hash, word_id, specificity, idf_q, n_occurrences) "
             "VALUES (?, ?, ?, ?, ?, ?) "
@@ -677,7 +689,7 @@ class Storage:
             "word_id = excluded.word_id, specificity = excluded.specificity, "
             "idf_q = excluded.idf_q, n_occurrences = excluded.n_occurrences, "
             "updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')",
-            (word, word_hash, word_id, specificity, idf_q, n_occurrences),
+            (word, word_hash_signed, word_id, specificity, idf_q, n_occurrences),
         )
 
         # Get the id (works for both insert and update)
@@ -754,7 +766,7 @@ class Storage:
         chunk_ids: list[int],
         query_reefs: list[tuple[int, float]],
     ) -> list[SearchResult]:
-        """Score specific chunks by reef overlap (used by lightning rod).
+        """Score specific chunks by IDF-weighted reef overlap (used by lightning rod).
 
         Same scoring formula as search_by_reef_overlap but pre-filtered
         to the given chunk IDs.
@@ -762,18 +774,23 @@ class Storage:
         if not chunk_ids or not query_reefs:
             return []
 
-        # Build query reef CTE
-        value_placeholders = ", ".join(["(?, ?)"] * len(query_reefs))
+        # Compute reef IDF for query-time weighting
+        reef_idf = self.get_reef_idf()
+        default_idf = max(reef_idf.values()) * 1.5 if reef_idf else 1.0
+
+        # Build query reef CTE with IDF column
+        value_placeholders = ", ".join(["(?, ?, ?)"] * len(query_reefs))
         params: list = []
         for reef_id, z_score in query_reefs:
-            params.extend([reef_id, z_score])
+            idf = reef_idf.get(reef_id, default_idf)
+            params.extend([reef_id, z_score, idf])
 
         # Build chunk_id filter
         chunk_placeholders = ", ".join(["?"] * len(chunk_ids))
         params.extend(chunk_ids)
 
         sql = f"""
-        WITH qr(reef_id, query_z) AS (VALUES {value_placeholders})
+        WITH qr(reef_id, query_z, reef_idf) AS (VALUES {value_placeholders})
         SELECT c.id, c.text, c.document_id, d.title AS document_title,
                c.section_id, s.title AS section_title,
                c.chunk_index, c.start_char, c.end_char,
@@ -781,7 +798,7 @@ class Storage:
                c.arch_score_0, c.arch_score_1, c.arch_score_2, c.arch_score_3, c.arch_score_4,
                c.reef_l2_norm,
                CASE WHEN c.reef_l2_norm > 0
-                    THEN SUM(cr.z_score * qr.query_z) * sqrt(COUNT(cr.reef_id)) / c.reef_l2_norm
+                    THEN SUM(cr.z_score * qr.query_z * qr.reef_idf) * sqrt(COUNT(cr.reef_id)) / c.reef_l2_norm
                     ELSE 0.0
                END AS match_score,
                COUNT(cr.reef_id) AS n_shared_reefs

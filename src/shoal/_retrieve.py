@@ -69,40 +69,45 @@ def search(
     # 1. Score the query — use fixed reef count, independent of result count
     result = scorer.score(query, top_k=_QUERY_REEF_COUNT)
 
-    # 2. Quality gate — if confidence is too low, reef overlap is noise
-    if result.confidence < _MIN_REEF_CONFIDENCE:
-        query_info = _build_query_info(result, total_words)
+    # 2. Detect custom words early — needed before quality gate decision
+    tagged_words: dict[int, int] | None = None
+    has_custom_words = False
+    if enable_lightning_rod and result.matched_word_ids:
+        tagged_words = scorer.get_word_tags(result.matched_word_ids)
+        has_custom_words = bool(tagged_words)
+
+    # 3. Quality gate — skip when custom words are present (lightning rod
+    #    provides word-level precision that doesn't depend on reef confidence)
+    if result.confidence < _MIN_REEF_CONFIDENCE and not has_custom_words:
+        query_info = _build_query_info(result, total_words, tagged_words=tagged_words)
         return SearchResponse(results=[], query_info=query_info)
 
-    # 3. Extract query reef pairs, filtering out negative z-scores
+    # 4. Extract query reef pairs, filtering out negative z-scores
     query_reefs = [
         (r.reef_id, r.z_score)
         for r in result.top_reefs
         if r.z_score > 0
     ]
 
-    # 4. Lightning rod: pre-filter by custom words
-    tagged_words: dict[int, int] | None = None
+    # 5. Lightning rod: pre-filter by custom words
     lightning_results: list[SearchResult] = []
     lightning_chunk_ids: set[int] = set()
 
-    if enable_lightning_rod and result.matched_word_ids:
-        tagged_words = scorer.get_word_tags(result.matched_word_ids)
-        if tagged_words:
-            custom_word_ids = list(tagged_words.values())
-            candidate_chunk_ids = storage.get_chunks_by_custom_words(
-                custom_word_ids, limit=_LIGHTNING_ROD_LIMIT,
+    if has_custom_words and tagged_words:
+        custom_word_ids = list(tagged_words.values())
+        candidate_chunk_ids = storage.get_chunks_by_custom_words(
+            custom_word_ids, limit=_LIGHTNING_ROD_LIMIT,
+        )
+        if candidate_chunk_ids and query_reefs:
+            lightning_results = storage.score_chunks_by_reef_overlap(
+                candidate_chunk_ids, query_reefs,
             )
-            if candidate_chunk_ids and query_reefs:
-                lightning_results = storage.score_chunks_by_reef_overlap(
-                    candidate_chunk_ids, query_reefs,
-                )
-                # Apply boost
-                for lr in lightning_results:
-                    lr.match_score *= _LIGHTNING_ROD_BOOST
-                lightning_chunk_ids = {r.chunk_id for r in lightning_results}
+            # Apply boost
+            for lr in lightning_results:
+                lr.match_score *= _LIGHTNING_ROD_BOOST
+            lightning_chunk_ids = {r.chunk_id for r in lightning_results}
 
-    # 5. Standard reef overlap retrieval (request extra to cover dedup)
+    # 6. Standard reef overlap retrieval (request extra to cover dedup)
     standard_top_k = top_k + len(lightning_chunk_ids)
     standard_results = storage.search_by_reef_overlap(
         query_reefs,
@@ -112,7 +117,7 @@ def search(
         include_scores=include_scores,
     )
 
-    # 6. Merge: lightning results + standard results (dedup by chunk_id)
+    # 7. Merge: lightning results + standard results (dedup by chunk_id)
     if lightning_results:
         merged_map: dict[int, SearchResult] = {}
         # Lightning results take priority (boosted scores)
@@ -127,7 +132,7 @@ def search(
         merged = sorted(merged_map.values(), key=lambda r: r.match_score, reverse=True)
         results = merged[:top_k]
 
-        # 7. If include_scores: fetch shared_reefs for lightning results that lack them
+        # 8. If include_scores: fetch shared_reefs for lightning results that lack them
         if include_scores:
             for r in results:
                 if r.chunk_id in lightning_chunk_ids and not r.shared_reefs:
@@ -135,7 +140,7 @@ def search(
     else:
         results = standard_results[:top_k]
 
-    # 8. Build query info with tagged_words
+    # 9. Build query info with tagged_words
     query_info = _build_query_info(result, total_words, tagged_words=tagged_words)
 
     return SearchResponse(results=results, query_info=query_info)

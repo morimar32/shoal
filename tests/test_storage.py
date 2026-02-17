@@ -207,10 +207,12 @@ class TestReefOverlapSearch:
         )
         assert len(results) == 1
         assert results[0].document_title == "Bio Doc"
-        # Scoring: dot * sqrt(n_shared) / reef_l2_norm
-        # dot = 5.0 * 4.0 = 20.0, n_shared = 1, l2_norm = sqrt(5^2 + 3^2) = sqrt(34)
+        # Scoring: SUM(chunk_z * query_z * reef_idf) * sqrt(n_shared) / reef_l2_norm
+        # IDF = log(1 + N/df): N=1, reef 42 df=1 → idf=log(2)
+        # dot = 5.0 * 4.0 * log(2) = 20 * log(2), n_shared = 1, l2_norm = sqrt(5^2 + 3^2) = sqrt(34)
         import math
-        expected = 20.0 * math.sqrt(1) / math.sqrt(34)
+        idf_42 = math.log(2)  # log(1 + 1/1)
+        expected = (5.0 * 4.0 * idf_42) * math.sqrt(1) / math.sqrt(34)
         assert results[0].match_score == pytest.approx(expected)
         assert results[0].n_shared_reefs == 1
         assert results[0].section_title == "Main"
@@ -246,10 +248,12 @@ class TestReefOverlapSearch:
         )
         assert len(results) == 1
         assert len(results[0].shared_reefs) == 2
-        # Scoring: dot * sqrt(n_shared) / reef_l2_norm
-        # dot = 5.0*4.0 + 3.0*2.0 = 26.0, n_shared = 2, l2_norm = sqrt(5^2 + 3^2) = sqrt(34)
+        # Scoring: SUM(chunk_z * query_z * reef_idf) * sqrt(n_shared) / reef_l2_norm
+        # IDF = log(1 + N/df): N=1, both reefs df=1 → idf=log(2)
+        # dot = (5.0*4.0 + 3.0*2.0) * log(2) = 26.0 * log(2), n_shared = 2, l2_norm = sqrt(34)
         import math
-        expected = 26.0 * math.sqrt(2) / math.sqrt(34)
+        idf = math.log(2)
+        expected = (5.0 * 4.0 * idf + 3.0 * 2.0 * idf) * math.sqrt(2) / math.sqrt(34)
         assert results[0].match_score == pytest.approx(expected)
 
     def test_search_no_overlap(self, storage):

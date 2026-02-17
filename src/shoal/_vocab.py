@@ -20,8 +20,9 @@ _LOW_SENTENCE_WEIGHT = 0.3
 _MIN_OCCURRENCES_SHORT = 2   # docs < 500 words
 _MIN_OCCURRENCES_LONG = 3    # docs >= 500 words
 _DOCUMENT_LENGTH_THRESHOLD = 500
-_ASSOCIATION_Z_THRESHOLD = 0.5
-_MAX_ASSOCIATED_REEFS = 30
+_ASSOCIATION_Z_THRESHOLD = 1.5
+_RELATIVE_Z_CUTOFF = 0.3  # keep reefs with mean_z >= 30% of max mean_z
+_MAX_ASSOCIATED_REEFS = 15
 _MAX_REEFS_PER_OBSERVATION = 20
 
 
@@ -174,11 +175,20 @@ def build_vocabulary(
             for rid in reef_z_sums
         }
 
-        # Keep reefs where mean_z >= threshold
+        # Keep reefs where mean_z >= absolute threshold
         qualifying = {
             rid: mz for rid, mz in mean_z.items()
             if mz >= association_z_threshold
         }
+
+        # Relative filter: also require mean_z >= 30% of the max
+        if qualifying:
+            peak_z = max(qualifying.values())
+            relative_cutoff = peak_z * _RELATIVE_Z_CUTOFF
+            qualifying = {
+                rid: mz for rid, mz in qualifying.items()
+                if mz >= relative_cutoff
+            }
 
         # Cap at max reefs
         if len(qualifying) > _MAX_ASSOCIATED_REEFS:

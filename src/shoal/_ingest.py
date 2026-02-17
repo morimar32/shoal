@@ -2,13 +2,19 @@
 
 from __future__ import annotations
 
+import hashlib
 from collections import Counter
 from typing import TYPE_CHECKING
 
 from ._models import ChunkData, DocFormat, IngestResult, SectionData
 from ._parsers import parse_sections
 from ._storage import Storage
-from ._vocab import build_vocabulary, collect_word_observations, get_custom_word_ids_for_chunk
+from ._vocab import (
+    _ASSOCIATION_Z_THRESHOLD,
+    build_vocabulary,
+    collect_word_observations,
+    get_custom_word_ids_for_chunk,
+)
 
 if TYPE_CHECKING:
     from lagoon import DocumentAnalysis, ReefScorer
@@ -35,7 +41,7 @@ def ingest_document(
     reef_top_k: int = 38,
     enable_vocab_extension: bool = True,
     confidence_threshold: float = 1.5,
-    association_z_threshold: float = 0.5,
+    association_z_threshold: float = _ASSOCIATION_Z_THRESHOLD,
 ) -> IngestResult:
     """Ingest a document: parse sections, analyze with lagoon, store in SQLite.
 
@@ -141,19 +147,29 @@ def ingest_document(
                     chunk_custom_word_map[chunk_index + ci] = cw_ids
                 chunk_index += len(section_chunks)
         else:
-            # No new words — reuse Pass 1 analyses
+            # No new words for THIS doc — reuse Pass 1 analyses,
+            # but still scan for custom words from previously-learned vocabulary
             chunk_index = 0
             for sec_idx, analysis in pass1_analyses:
                 section_chunks = _chunks_from_analysis(
                     analysis, sections[sec_idx], sec_idx, chunk_index,
                 )
+                # Extract custom word IDs from Pass 1 matched_word_ids
+                for seg_idx, segment in enumerate(analysis.segments):
+                    all_word_ids: set[int] = set(segment.topic.matched_word_ids)
+                    for sent_result in segment.sentence_results:
+                        all_word_ids.update(sent_result.matched_word_ids)
+                    tagged = get_custom_word_ids_for_chunk(scorer, frozenset(all_word_ids))
+                    if tagged:
+                        chunk_custom_word_map[chunk_index + seg_idx] = list(set(tagged.values()))
                 all_chunks.extend(section_chunks)
                 chunk_index += len(section_chunks)
     else:
-        # Single-pass: unchanged Phase 1 path
+        # Single-pass (vocab extension disabled), but still track custom words
+        # from vocabulary loaded at startup
         chunk_index = 0
         for sec_idx, section in enumerate(sections):
-            section_chunks = _analyze_section(
+            section_chunks, cw_map = _analyze_section_pass2(
                 scorer=scorer,
                 section=section,
                 section_index=sec_idx,
@@ -161,26 +177,34 @@ def ingest_document(
                 **analyze_kwargs,
             )
             all_chunks.extend(section_chunks)
+            for ci, cw_ids in cw_map.items():
+                chunk_custom_word_map[chunk_index + ci] = cw_ids
             chunk_index += len(section_chunks)
 
-    # 7. Filter out tiny chunks
-    if min_chunk_chars > 0:
-        filtered: list[ChunkData] = []
-        old_to_new: dict[int, int] = {}
-        for chunk in all_chunks:
-            if len(chunk.text) >= min_chunk_chars:
-                old_idx = chunk.chunk_index
-                chunk.chunk_index = len(filtered)
-                old_to_new[old_idx] = chunk.chunk_index
-                filtered.append(chunk)
-        all_chunks = filtered
+    # 7. Filter out tiny chunks and deduplicate by text content
+    filtered: list[ChunkData] = []
+    old_to_new: dict[int, int] = {}
+    seen_hashes: set[str] = set()
+    for chunk in all_chunks:
+        if min_chunk_chars > 0 and len(chunk.text) < min_chunk_chars:
+            continue
+        # Deduplicate: skip chunks with identical text within the same document
+        text_hash = hashlib.sha256(chunk.text.encode()).hexdigest()
+        if text_hash in seen_hashes:
+            continue
+        seen_hashes.add(text_hash)
+        old_idx = chunk.chunk_index
+        chunk.chunk_index = len(filtered)
+        old_to_new[old_idx] = chunk.chunk_index
+        filtered.append(chunk)
+    all_chunks = filtered
 
-        # Remap chunk_custom_word_map
-        remapped: dict[int, list[int]] = {}
-        for old_idx, cw_ids in chunk_custom_word_map.items():
-            if old_idx in old_to_new:
-                remapped[old_to_new[old_idx]] = cw_ids
-        chunk_custom_word_map = remapped
+    # Remap chunk_custom_word_map
+    remapped: dict[int, list[int]] = {}
+    for old_idx, cw_ids in chunk_custom_word_map.items():
+        if old_idx in old_to_new:
+            remapped[old_to_new[old_idx]] = cw_ids
+    chunk_custom_word_map = remapped
 
     # 8. Store chunks
     chunk_ids: list[int] = []
@@ -189,8 +213,8 @@ def ingest_document(
             doc_id, all_chunks, section_ids=section_ids, reef_top_k=reef_top_k,
         )
 
-    # 9. Record chunk custom words (if Pass 2 was run)
-    if two_pass and chunk_ids:
+    # 9. Record chunk custom words (any path that found custom words)
+    if chunk_ids and chunk_custom_word_map:
         for i, db_chunk_id in enumerate(chunk_ids):
             chunk_idx = all_chunks[i].chunk_index
             cw_ids = chunk_custom_word_map.get(chunk_idx, [])
