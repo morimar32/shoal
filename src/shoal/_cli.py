@@ -41,6 +41,8 @@ _PREVIEW = "\033[37m"     # light gray — text previews
 _BAR = "\033[90m"         # dark gray — bars/lines
 _Z_CHUNK = "\033[1;32m"   # bold green — chunk z-scores
 _Z_QUERY = "\033[1;36m"   # bold cyan — query z-scores
+_SECTION = "\033[36m"     # cyan — section paths
+_WARN = "\033[1;33m"      # bold yellow — warnings
 
 # Unicode characters
 _HLINE = "\u2500"       # ─
@@ -48,15 +50,19 @@ _BLOCK_FULL = "\u2588"  # █
 _BLOCK_LIGHT = "\u2591" # ░
 _DIAMOND = "\u25c6"     # ◆
 _ARROW = "\u2192"       # →
+_TREE_BRANCH = "\u251c" # ├
+_TREE_LAST = "\u2514"   # └
+_TREE_PIPE = "\u2502"   # │
 
 _ARCH_NAMES = [
     "natural sciences & taxonomy",
     "physical world & materiality",
     "abstract processes & systems",
     "social order & assessment",
+    "specialized activities & practices",
 ]
 
-_ARCH_SYMBOLS = ["N", "P", "A", "S"]
+_ARCH_SYMBOLS = ["N", "P", "A", "S", "Sp"]
 
 
 def _c(code: str, text: str) -> str:
@@ -104,7 +110,7 @@ def _dominant_arch(arch_scores: list[float]) -> tuple[int, str]:
 
 def _arch_sparkline(arch_scores: list[float]) -> str:
     """Render a compact sparkline of arch scores with labels."""
-    if not arch_scores or len(arch_scores) < 4:
+    if not arch_scores or len(arch_scores) < 5:
         return ""
     total = sum(arch_scores) or 1.0
     parts = []
@@ -117,6 +123,13 @@ def _arch_sparkline(arch_scores: list[float]) -> str:
         else:
             parts.append(_c(_LABEL, f"{sym}:{pct:.0f}%"))
     return " ".join(parts)
+
+
+def _format_section_path(path: list[str]) -> str:
+    """Format a section path as 'A > B > C'."""
+    if not path:
+        return ""
+    return " > ".join(path)
 
 
 # ── Commands ──
@@ -148,7 +161,7 @@ def _cmd_ingest(args: argparse.Namespace) -> None:
             tags=tags,
             source_path=str(path),
         )
-        print(f"Ingested: {result.title} ({result.n_chunks} chunks, id={result.id})")
+        print(f"Ingested: {result.title} ({result.n_sections} sections, {result.n_chunks} chunks, id={result.id})")
 
 
 def _cmd_ingest_dir(args: argparse.Namespace) -> None:
@@ -180,7 +193,7 @@ def _cmd_ingest_dir(args: argparse.Namespace) -> None:
                 tags=tags,
                 source_path=str(path),
             )
-            print(f"  {result.title}: {result.n_chunks} chunks (id={result.id})")
+            print(f"  {result.title}: {result.n_sections} sections, {result.n_chunks} chunks (id={result.id})")
         print(f"\nIngested {len(files)} files.")
 
 
@@ -207,7 +220,22 @@ def _print_search_results(response: SearchResponse, query: str, show_scores: boo
     print()
     print(f"  {_c(_LABEL, 'Query:')} {_c(_QUERY, query)}")
     print(f"  {_c(_LABEL, 'confidence')} {_c(_conf_color(qi.confidence), f'{qi.confidence:.2f}')}  "
-          f"{_c(_LABEL, 'coverage')} {_c(_cov_color(qi.coverage), f'{qi.coverage:.2f}')}")
+          f"{_c(_LABEL, 'coverage')} {_c(_cov_color(qi.coverage), f'{qi.coverage:.2f}')}  "
+          f"{_c(_LABEL, 'words')} {_c(_DIM, f'{qi.matched_words}/{qi.total_words}')}")
+
+    # ── Low-confidence warning ──
+    if qi.confidence < 0.1:
+        explain_hint = f'  Run `shoal explain "{query}"` for per-word diagnostics.'
+        print()
+        print(f"  {_c(_WARN, f'{_DIAMOND} WARNING: Very low query confidence ({qi.confidence:.4f}).')}")
+        print(f"  {_c(_WARN, '  The scorer has almost no semantic signal for this query.')}")
+        print(f"  {_c(_WARN, '  Results are driven by incidental reef overlap, not topical matching.')}")
+        print(f"  {_c(_WARN, explain_hint)}")
+    elif qi.confidence < 0.5:
+        explain_hint = f'  Run `shoal explain "{query}"` for diagnostics.'
+        print()
+        print(f"  {_c(_WARN, f'{_DIAMOND} Low query confidence ({qi.confidence:.2f}). Results may be inaccurate.')}")
+        print(f"  {_c(_WARN, explain_hint)}")
     print()
 
     # ── Query reef profile ──
@@ -243,6 +271,11 @@ def _print_search_results(response: SearchResponse, query: str, show_scores: boo
         rank_str = _c(_NUM, f" {i:2d}.")
         title_str = _c(_TITLE, r.document_title)
         print(f"{rank_str} {title_str}")
+
+        # ── Section path ──
+        if r.section_path:
+            path_str = _format_section_path(r.section_path)
+            print(f"     {_c(_LABEL, '[')} {_c(_SECTION, path_str)} {_c(_LABEL, ']')}")
 
         # ── Score bar + match score ──
         bar = _score_bar(r.match_score, max_score)
@@ -290,12 +323,119 @@ def _print_search_results(response: SearchResponse, query: str, show_scores: boo
     print()
 
 
+def _cmd_sections(args: argparse.Namespace) -> None:
+    """Display the section tree for a document."""
+    with Engine(db_path=args.db) as engine:
+        doc = engine.storage.get_document(args.doc_id)
+        if doc is None:
+            print(f"Error: document {args.doc_id} not found", file=sys.stderr)
+            sys.exit(1)
+
+        sections = engine.storage.get_sections_for_document(args.doc_id)
+        if not sections:
+            print(f"No sections found for document '{doc['title']}' (id={args.doc_id})")
+            return
+
+        print(f"\n  {_c(_TITLE, doc['title'])} {_c(_LABEL, f'(id={args.doc_id})')}")
+        print()
+
+        # Build tree structure for display
+        # Group sections by parent_id
+        children: dict[int | None, list[dict]] = {}
+        for s in sections:
+            parent = s["parent_id"]
+            children.setdefault(parent, []).append(s)
+
+        def _print_tree(parent_id: int | None, prefix: str = "  ") -> None:
+            kids = children.get(parent_id, [])
+            for i, s in enumerate(kids):
+                is_last = (i == len(kids) - 1)
+                connector = _TREE_LAST if is_last else _TREE_BRANCH
+                chunk_info = _c(_LABEL, f"({s['n_chunks']} chunks)")
+                depth_info = _c(_DIM, f"d{s['depth']}")
+                print(f"{prefix}{_c(_BAR, connector + _HLINE)} {_c(_SECTION, s['title'])} "
+                      f"{chunk_info} {depth_info}")
+                child_prefix = prefix + ("   " if is_last else f"{_c(_BAR, _TREE_PIPE)}  ")
+                _print_tree(s["id"], child_prefix)
+
+        _print_tree(None)
+        print()
+
+
+def _cmd_explain(args: argparse.Namespace) -> None:
+    """Explain how a query is understood by the scorer."""
+    with Engine(db_path=args.db) as engine:
+        info = engine.explain_query(args.query)
+
+    print()
+    print(f"  {_c(_LABEL, 'Query:')} {_c(_QUERY, info['query'])}")
+    conf_val = f"{info['confidence']:.4f}"
+    cov_val = f"{info['coverage']:.2f}"
+    words_val = f"{info['matched_words']}/{info['total_words']}"
+    print(f"  {_c(_LABEL, 'confidence')} {_c(_conf_color(info['confidence']), conf_val)}  "
+          f"{_c(_LABEL, 'coverage')} {_c(_cov_color(info['coverage']), cov_val)}  "
+          f"{_c(_LABEL, 'words')} {_c(_DIM, words_val)}")
+    print()
+
+    # ── Warnings ──
+    if info["warnings"]:
+        for warning in info["warnings"]:
+            print(f"  {_c(_WARN, f'{_DIAMOND} {warning}')}")
+        print()
+
+    # ── Per-word breakdown ──
+    print(f"  {_c(_LABEL, 'Per-word breakdown:')}")
+    print()
+    for wd in info["word_details"]:
+        conf = wd["confidence"]
+        conf_str = _c(_conf_color(conf), f"{conf:.4f}")
+
+        # Signal strength indicator
+        if conf >= 0.5:
+            indicator = _c(_GOOD, "STRONG")
+        elif conf >= 0.1:
+            indicator = _c(_MED, "WEAK  ")
+        else:
+            indicator = _c(_LOW, "NONE  ")
+
+        print(f"    {indicator}  {_c(_BOLD, wd['word']):20s}  "
+              f"{_c(_LABEL, 'conf')} {conf_str}")
+        for reef in wd["top_reefs"][:2]:
+            z = reef["z_score"]
+            print(f"             {_c(_REEF, reef['reef_name'])}{_c(_LABEL, ':')} "
+                  f"{_c(_SCORE, f'{z:.2f}')}")
+        print()
+
+    # ── Combined query reef profile ──
+    hline = _HLINE * 60
+    print(f"  {_c(_BAR, hline)}")
+    print(f"  {_c(_LABEL, 'Combined query reef profile:')}")
+    for reef in info["top_reefs"][:7]:
+        z = reef["z_score"]
+        n_words = reef["n_contributing_words"]
+        word_label = "words" if n_words != 1 else "word"
+        word_count = f"({n_words} {word_label})"
+        print(f"    {_c(_REEF, reef['reef_name'])}{_c(_LABEL, ':')} "
+              f"{_c(_SCORE, f'z={z:.2f}')}  "
+              f"{_c(_DIM, word_count)}")
+
+    if info["top_islands"]:
+        print(f"  {_c(_LABEL, 'Combined query islands:')}")
+        for isl in info["top_islands"][:3]:
+            agg_z = f"{isl['aggregate_z']:.2f}"
+            print(f"    {_c(_ISLAND, isl['island_name'])}{_c(_LABEL, ':')} "
+                  f"{_c(_SCORE, agg_z)}")
+
+    print()
+
+
 def _cmd_status(args: argparse.Namespace) -> None:
     """Show system status."""
     with Engine(db_path=args.db) as engine:
         s = engine.status()
         print(f"Status: {s['status']}")
         print(f"Documents: {s['n_documents']}")
+        print(f"Sections: {s['n_sections']}")
         print(f"Chunks: {s['n_chunks']}")
         print(f"Lagoon version: {s['lagoon_version']}")
         print(f"DB path: {s['db_path']}")
@@ -330,6 +470,14 @@ def main(argv: list[str] | None = None) -> None:
     p_search.add_argument("--min-confidence", type=float, help="Minimum chunk confidence")
     p_search.add_argument("--scores", action="store_true", help="Show shared reef details")
 
+    # explain
+    p_explain = subparsers.add_parser("explain", help="Explain how a query is scored")
+    p_explain.add_argument("query", help="Query text to analyze")
+
+    # sections
+    p_sections = subparsers.add_parser("sections", help="Show section tree for a document")
+    p_sections.add_argument("doc_id", type=int, help="Document ID")
+
     # status
     subparsers.add_parser("status", help="Show system status")
 
@@ -343,6 +491,8 @@ def main(argv: list[str] | None = None) -> None:
         "ingest": _cmd_ingest,
         "ingest-dir": _cmd_ingest_dir,
         "search": _cmd_search,
+        "explain": _cmd_explain,
+        "sections": _cmd_sections,
         "status": _cmd_status,
     }
     commands[args.command](args)

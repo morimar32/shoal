@@ -22,6 +22,19 @@ class ParsedSection:
 
 
 @dataclass(slots=True)
+class SectionData:
+    """A section node for storage."""
+    title: str
+    depth: int
+    position: int
+    start_char: int
+    end_char: int
+    parent_index: int | None   # index into flat list for tree building, resolved to parent_id at insert time
+    analysis_text: str         # combined text for lagoon analysis
+    metadata: dict = field(default_factory=dict)
+
+
+@dataclass(slots=True)
 class ChunkData:
     """Intermediate chunk before storage."""
     text: str
@@ -37,6 +50,7 @@ class ChunkData:
     arch_scores: list[float]
     top_reefs: list[tuple[int, str, float, float, int]]  # (reef_id, name, z_score, raw_bm25, n_contributing_words)
     top_islands: list[tuple[int, str, float, int]]  # (island_id, name, aggregate_z, n_contributing_reefs)
+    section_index: int = 0     # index into section list, resolved to section_id during storage
     metadata: dict = field(default_factory=dict)
 
 
@@ -62,6 +76,9 @@ class SearchResult:
     confidence: float
     coverage: float
     top_reef_name: str
+    chunk_id: int = 0
+    section_title: str = ""
+    section_path: list[str] = field(default_factory=list)
     arch_scores: list[float] = field(default_factory=list)
     shared_reefs: list[SharedReef] = field(default_factory=list)
 
@@ -72,6 +89,8 @@ class QueryInfo:
     top_reef: str
     confidence: float
     coverage: float
+    matched_words: int
+    total_words: int
     top_reefs: list[dict]  # [{"reef_name": str, "z_score": float}, ...]
     top_islands: list[dict] = field(default_factory=list)  # [{"island_name": str, "aggregate_z": float}, ...]
 
@@ -89,4 +108,5 @@ class IngestResult:
     id: int
     title: str
     n_chunks: int
+    n_sections: int
     tags: list[str]

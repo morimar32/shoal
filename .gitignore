@@ -215,3 +215,6 @@ docs/
 
 # local db files
 *.db
+
+# notes are for myself
+research/

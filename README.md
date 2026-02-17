@@ -1,6 +1,8 @@
 # Shoal
 
-Shoal is a retrieval engine — the "R" in RAG — built on [lagoon](https://github.com/morimar32/lagoon). It ingests documents, chunks them using lagoon's topic-shift detection, scores each chunk against 207 semantic reefs, and stores structured reef metadata in SQLite. Retrieval is standard SQL: score the query, find chunks whose reef profiles overlap via joins and filters. No vectors, no embeddings, no cosine similarity.
+Shoal is a proof-of-concept retrieval engine — the "R" in RAG — built on [lagoon](https://github.com/morimar32/lagoon). Its purpose is to exercise and stress-test lagoon's reef-based scoring on real documents. It ingests documents, parses them into hierarchical sections, chunks them using lagoon's topic-shift detection, scores each chunk against 207 semantic reefs, and stores structured reef metadata in SQLite. Retrieval uses reef overlap scoring. No vectors, no embeddings, no cosine similarity.
+
+> **Note:** Shoal is a test bed for the lagoon scoring library and its data. If you find scoring anomalies, missing vocabulary, or reef misclassifications, please report them upstream to the [lagoon](https://github.com/morimar32/lagoon) project.
 
 **Naming:** `shoal` is the library. `shoald` is the HTTP REST daemon (Phase 3).
 
@@ -27,7 +29,7 @@ shoal ingest docs/photosynthesis.md
 # Ingest an entire directory of .md and .txt files
 shoal ingest-dir docs/
 
-# Search
+# Search (reef overlap scoring)
 shoal search "photosynthesis in plants"
 
 # Search with shared reef details
@@ -36,6 +38,12 @@ shoal search "volcanic eruption geology" --scores
 # Filter by tag
 shoal ingest docs/photosynthesis.md --tags biology,plants
 shoal search "chlorophyll" --tags biology
+
+# Diagnose a query — per-word scoring breakdown
+shoal explain "rook movements"
+
+# View the section tree for a document
+shoal sections 5
 
 # Check status
 shoal status
@@ -57,12 +65,13 @@ with Engine(db_path="shoal.db") as engine:
         format=DocFormat.markdown,
         tags=["biology"],
     )
-    print(f"Ingested: {result.n_chunks} chunks")
+    print(f"Ingested: {result.n_chunks} chunks, {result.n_sections} sections")
 
-    # Search
+    # Search (reef overlap scoring)
     response = engine.search("photosynthesis in plants", top_k=10)
     for r in response.results:
-        print(f"  [{r.document_title}] score={r.match_score:.1f} reef={r.top_reef_name}")
+        section = " > ".join(r.section_path) if r.section_path else ""
+        print(f"  [{r.document_title} | {section}] score={r.match_score:.4f} reef={r.top_reef_name}")
 
     # Search with detailed reef overlap
     response = engine.search("chlorophyll", include_scores=True)
@@ -80,19 +89,20 @@ with Engine(db_path="shoal.db") as engine:
 
 | Phase | Status | Description |
 |-------|--------|-------------|
-| **Phase 1** | **Done** | Core library: ingest, chunk, store, retrieve via CLI and Python API. Single-pass ingestion (no vocabulary extension). |
+| **Phase 1** | **Done** | Core library: ingest, chunk, store, retrieve via CLI and Python API. Hierarchical document sections, reef overlap retrieval. Single-pass ingestion (no vocabulary extension). |
 | **Phase 2** | Planned | Vocabulary extension: two-pass ingestion pipeline, context-based reef learning for unknown words, compound detection. |
 | **Phase 3** | Planned | `shoald` REST API: FastAPI HTTP daemon wrapping the library. |
 
 ### What's built (Phase 1)
 
 - Document ingestion with lagoon topic-shift chunking (markdown + plaintext)
-- Full SQLite schema (all 8 tables, including vocabulary tables ready for Phase 2)
-- SQL reef-overlap retrieval with tag filtering, confidence thresholds, and shared reef detail
+- **Hierarchical document sections**: documents are parsed into section trees (markdown: H2/H3 hierarchy with folding heuristics; plaintext: chapter detection via regex patterns). Sections sit between documents and chunks, providing structural context for search results.
+- Full SQLite schema (including `sections` table and vocabulary tables ready for Phase 2)
+- **Reef overlap retrieval**: chunks are ranked by normalized reef overlap with the query — `SUM(chunk_z * query_z) * sqrt(n_shared) / reef_l2_norm`.
 - `Engine` class with context manager support
-- CLI: `ingest`, `ingest-dir`, `search`, `status`
-- 37 tests covering parsers, storage, ingestion, retrieval, and engine integration
-- Test corpus: 28 documents (26 Wikipedia + 2 Gutenberg books) producing 3,400+ chunks
+- CLI: `ingest`, `ingest-dir`, `search`, `explain`, `sections`, `status`
+- 68 tests covering parsers, storage, ingestion, retrieval, and engine integration
+- Test corpus: 38 documents (36 Wikipedia + 2 Gutenberg books) producing 3,500+ chunks across 890 sections
 
 ---
 
@@ -100,21 +110,21 @@ with Engine(db_path="shoal.db") as engine:
 
 ```
 src/shoal/
-├── __init__.py       # Public API: Engine, DocFormat, result types
-├── _models.py        # Dataclasses: DocFormat, ChunkData, SearchResult, etc.
-├── _parsers.py       # Markdown section splitter, plaintext passthrough
-├── _storage.py       # SQLite schema, CRUD, reef overlap retrieval query
-├── _ingest.py        # Ingestion pipeline: parse → analyze → store
-├── _retrieve.py      # Score query → SQL reef overlap → ranked results
+├── __init__.py       # Public API: Engine, DocFormat, SectionData, result types
+├── _models.py        # Dataclasses: DocFormat, SectionData, ChunkData, SearchResult, etc.
+├── _parsers.py       # Markdown section tree builder, plaintext chapter detection
+├── _storage.py       # SQLite schema (incl. sections), CRUD, reef overlap retrieval
+├── _ingest.py        # Ingestion pipeline: parse sections → analyze → store
+├── _retrieve.py      # Retrieval: reef overlap scoring
 ├── _vocab.py         # Stub for Phase 2 vocabulary extension
 ├── _engine.py        # Engine class: top-level orchestrator
-└── _cli.py           # CLI: ingest, ingest-dir, search, status
+└── _cli.py           # CLI: ingest, ingest-dir, search, explain, sections, status
 tests/
 ├── conftest.py       # Fixtures: scorer (session-scoped), storage, engine
-├── test_parsers.py   # Markdown/plaintext parsing tests
-├── test_storage.py   # CRUD + reef overlap search tests
-├── test_ingest.py    # Ingestion pipeline tests
-├── test_retrieve.py  # Retrieval tests
+├── test_parsers.py   # Markdown/plaintext parsing + section tree tests
+├── test_storage.py   # CRUD, section storage, reef overlap search tests
+├── test_ingest.py    # Ingestion pipeline + section creation tests
+├── test_retrieve.py  # Hybrid retrieval tests
 └── test_engine.py    # Engine integration tests
 pyproject.toml        # Hatch build, src/ layout
 ```
@@ -144,7 +154,7 @@ Ingest all `.md` and `.txt` files in a directory. Shows progress per file.
 
 ### `shoal search <query>`
 
-Search and display ranked results with match score, shared reef count, confidence, top reef name, and text preview.
+Search using reef overlap retrieval. Results display section path, match score, shared reef count, confidence, and text preview.
 
 | Flag | Description |
 |------|-------------|
@@ -153,9 +163,19 @@ Search and display ranked results with match score, shared reef count, confidenc
 | `--min-confidence` | Minimum chunk confidence threshold |
 | `--scores` | Show individual shared reef z-scores |
 
+Low-confidence queries (where lagoon has weak semantic signal for the query terms) display a warning with a suggestion to run `shoal explain`.
+
+### `shoal explain <query>`
+
+Diagnose how a query is understood by the scorer. Shows per-word confidence breakdown with STRONG/WEAK/NONE indicators, per-word reef mappings, combined query reef profile, and actionable warnings about weak signal words.
+
+### `shoal sections <doc_id>`
+
+Display the section tree for a document, showing title, depth, and chunk count per section with tree-drawing characters.
+
 ### `shoal status`
 
-Display document count, chunk count, lagoon version, and database path.
+Display document count, section count, chunk count, lagoon version, and database path.
 
 ---
 
@@ -173,10 +193,11 @@ Engine(db_path="shoal.db", lagoon_data_dir=None)
 |--------|---------|-------------|
 | `start()` | `None` | Load lagoon scorer and connect to database |
 | `close()` | `None` | Close database connection |
-| `ingest(*, title, content, format, tags, ...)` | `IngestResult` | Ingest a document |
-| `search(query, *, top_k, tags, min_confidence, include_scores)` | `SearchResponse` | Search for matching chunks |
-| `delete_document(doc_id)` | `bool` | Delete a document and its chunks |
-| `status()` | `dict` | System status (counts, lagoon version, db path) |
+| `ingest(*, title, content, format, tags, ...)` | `IngestResult` | Ingest a document (parses sections, chunks, stores) |
+| `search(query, *, top_k, tags, min_confidence, include_scores)` | `SearchResponse` | Search via reef overlap scoring |
+| `explain_query(query)` | `dict` | Per-word scoring diagnostic with warnings |
+| `delete_document(doc_id)` | `bool` | Delete a document and its chunks/sections |
+| `status()` | `dict` | System status (counts incl. sections, lagoon version, db path) |
 
 Supports context manager (`with Engine(...) as engine:`).
 
@@ -185,11 +206,12 @@ Supports context manager (`with Engine(...) as engine:`).
 | Type | Fields |
 |------|--------|
 | `DocFormat` | Enum: `markdown`, `plaintext` |
-| `IngestResult` | `id`, `title`, `n_chunks`, `tags` |
+| `SectionData` | `title`, `depth`, `position`, `start_char`, `end_char`, `parent_index`, `analysis_text`, `metadata` |
+| `IngestResult` | `id`, `title`, `n_chunks`, `n_sections`, `tags` |
 | `SearchResponse` | `results: list[SearchResult]`, `query_info: QueryInfo` |
-| `SearchResult` | `text`, `match_score`, `n_shared_reefs`, `document_id`, `document_title`, `chunk_index`, `start_char`, `end_char`, `confidence`, `coverage`, `top_reef_name`, `shared_reefs` |
+| `SearchResult` | `text`, `match_score`, `n_shared_reefs`, `document_id`, `document_title`, `chunk_index`, `start_char`, `end_char`, `confidence`, `coverage`, `top_reef_name`, `chunk_id`, `section_title`, `section_path`, `shared_reefs` |
 | `SharedReef` | `reef_name`, `chunk_z`, `query_z` |
-| `QueryInfo` | `top_reef`, `confidence`, `coverage`, `top_reefs` |
+| `QueryInfo` | `top_reef`, `confidence`, `coverage`, `matched_words`, `total_words`, `top_reefs`, `top_islands` |
 
 ---
 
@@ -229,10 +251,11 @@ Supports context manager (`with Engine(...) as engine:`).
 ```
 
 **shoal** (library) handles:
-- Document ingestion and format parsing (markdown, plain text)
+- Document ingestion, format parsing (markdown, plain text), and hierarchical section extraction
 - Chunking via lagoon's topic-shift detection with size constraints
 - Per-chunk scoring via lagoon to produce structured reef metadata
-- SQLite storage and SQL-based retrieval over reef scores
+- SQLite storage with structured reef metadata
+- Retrieval via reef overlap scoring
 - Vocabulary extension: learning reef associations for unknown words from document context *(Phase 2)*
 
 **shoald** (daemon) handles *(Phase 3)*:
@@ -242,7 +265,7 @@ Supports context manager (`with Engine(...) as engine:`).
 
 **lagoon** is loaded once at startup via `lagoon.load()`. In Phase 2, it will be extended with custom vocabulary from shoal's database using lagoon's public vocabulary extension API: `add_custom_word()` injects individual words, `compute_custom_word_scores()` computes BM25 entries, and `rebuild_compounds()` merges custom compounds into the Aho-Corasick automaton. After extension, the scorer operates on the superset vocabulary transparently — all downstream code (scoring, analysis) benefits from the extended vocabulary without modification.
 
-**SQLite3** is the storage backend. Standard library `sqlite3` — no extensions required. Reef scores are stored as structured SQL rows, queried with standard joins and filters. Custom vocabulary is also stored in SQLite, feeding back into the scorer at startup.
+**SQLite3** is the storage backend. Standard library `sqlite3`, no extensions required. Reef scores are stored as structured SQL rows, queried with standard joins and filters. Custom vocabulary is also stored in SQLite, feeding back into the scorer at startup.
 
 ---
 
@@ -341,7 +364,7 @@ Lagoon's `score_raw()` returns a 207-element z-score vector, and lagoon uses the
 
 2. **SQL is the right query language.** "Find chunks about botanical classification with confidence > 2.0 tagged as biology" is a SQL WHERE clause, not a nearest-neighbor search. The structured reef data enables precise, interpretable, composable queries.
 
-3. **No extension dependencies.** Standard SQLite, standard SQL. No sqlite-vec, no FAISS, no ANN index. The retrieval engine is as portable and simple as the storage.
+3. **Minimal dependencies.** Standard SQLite, no extensions. No sqlite-vec, no FAISS, no ANN index. The retrieval engine uses structured SQL joins — no vector math at query time.
 
 ### Reef Hierarchy Reference
 
@@ -492,19 +515,30 @@ See [Section 2 — Vocabulary Extension at Startup](#vocabulary-extension-at-sta
 
 ### Current Implementation (Phase 1 — Single Pass)
 
-Phase 1 uses a single-pass pipeline: parse the document into sections, run `scorer.analyze()` once per section, and store the resulting chunks. No vocabulary extension.
+Phase 1 uses a single-pass pipeline: parse the document into a hierarchical section tree, run `scorer.analyze()` once per section, and store the resulting chunks with section references. No vocabulary extension.
 
 **Markdown (.md)**
 1. Parse structure: extract header hierarchy (h1-h6), clean Wikipedia artifacts (`[edit]` lines, `Main article:` lines)
-2. For each section (text between headers):
-   - Run `scorer.analyze(section_text)` for topic-shift detection and chunk sizing
+2. Build hierarchical section tree using header depth heuristics:
+   - **H1** → document title, not a section node. Preamble text before the first H2 becomes an "Introduction" section if substantial (≥ `min_section_length` chars)
+   - **H2** → always a top-level section (depth 0)
+   - **H3** → section (depth 1) if its text content ≥ `min_section_length`, otherwise folded into its parent H2 section (text preserved, sub-header title kept as a topic-shift signal)
+   - **H4+** → always folded into the nearest ancestor section
+3. For each section in the tree:
+   - Run `scorer.analyze(section.analysis_text)` for topic-shift detection and chunk sizing
    - Compute character offsets by walking through the section text with a cursor
-   - Store each segment as a chunk with the header hierarchy as metadata
+   - Store each segment as a chunk linked to its section
 
 **Plain text (.txt)**
-1. Return the full text as a single section
-2. Run `scorer.analyze(text)` for topic-shift detection
-3. Store each segment as a chunk
+1. Detect chapter structure via regex patterns, tried in priority order:
+   - `CHAPTER XIV. Title` (Roman numeral)
+   - `Chapter 14: Title` (Arabic numeral)
+   - `PART III. Title`
+   - `BOOK II`
+2. Use the first pattern producing ≥ 2 matches. Dense TOC clusters (many matches in few lines at the start) are filtered — only matches followed by substantial body text (≥ 200 chars) are used.
+3. Content before the first chapter → "Front Matter" section if substantial.
+4. Fallback (no chapter patterns match): entire document becomes a single section titled with the document title.
+5. For each section: run `scorer.analyze(section_text)` for topic-shift detection, store each segment as a chunk linked to its section
 
 ### Full Pipeline (Phase 2 — Two-Pass with Vocabulary Extension)
 
@@ -614,12 +648,35 @@ CREATE INDEX idx_document_tags_tag ON document_tags(tag);
 
 Flat tag model — each document has zero or more string tags. No tag hierarchy, no tag table. Tags are denormalized for query simplicity: filter by tag with a simple join or subquery.
 
+### `sections` table
+
+```sql
+CREATE TABLE sections (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+    parent_id   INTEGER REFERENCES sections(id) ON DELETE CASCADE,
+    title       TEXT NOT NULL,
+    depth       INTEGER NOT NULL DEFAULT 0,   -- 0 = top-level, 1 = child, ...
+    position    INTEGER NOT NULL,             -- order among siblings (0-indexed)
+    start_char  INTEGER NOT NULL,
+    end_char    INTEGER NOT NULL,
+    n_chunks    INTEGER NOT NULL DEFAULT 0,   -- direct child chunk count
+    metadata    TEXT DEFAULT '{}'
+);
+
+CREATE INDEX idx_sections_document_id ON sections(document_id);
+CREATE INDEX idx_sections_parent_id ON sections(parent_id);
+```
+
+Sections form a recursive tree between documents and chunks. `parent_id` is NULL for top-level sections and references another section for subsections. `n_chunks` is set at ingestion time after chunks are created, enabling "3 of 5 chunks in this section matched" optimizations without an extra COUNT query at retrieval.
+
 ### `chunks` table
 
 ```sql
 CREATE TABLE chunks (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     document_id     INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+    section_id      INTEGER NOT NULL REFERENCES sections(id) ON DELETE CASCADE,
     chunk_index     INTEGER NOT NULL,       -- 0-indexed position within document
     text            TEXT NOT NULL,
     start_char      INTEGER NOT NULL,       -- character offset in source document
@@ -639,9 +696,12 @@ CREATE TABLE chunks (
 );
 
 CREATE INDEX idx_chunks_document_id ON chunks(document_id);
+CREATE INDEX idx_chunks_section_id ON chunks(section_id);
 CREATE INDEX idx_chunks_top_reef_id ON chunks(top_reef_id);
 CREATE INDEX idx_chunks_confidence ON chunks(confidence);
 ```
+
+Each chunk belongs to both a document (for fast document-level queries) and a section (for structural context). `chunk_index` is document-wide sequential.
 
 ### `chunk_reefs` table
 
@@ -731,7 +791,8 @@ Raw observations from Pass 1 of ingestion. Each row records one occurrence of an
 
 ### Row Counts
 
-For a corpus of N chunks with top_k=10:
+For a corpus of D documents, S sections, and N chunks with top_k=10:
+- `sections`: S rows (typically 5-50 per document depending on structure)
 - `chunks`: N rows
 - `chunk_reefs`: ~10N rows (10 reefs per chunk)
 - `chunk_islands`: ~5N rows (variable, typically 3-7 islands per chunk)
@@ -739,98 +800,78 @@ For a corpus of N chunks with top_k=10:
 - `custom_word_reefs`: ~10-20 per custom word (associated reefs)
 - `word_observations`: temporary — potentially large during ingestion, can be pruned after vocabulary build
 
-For the test corpus (~500-1000 chunks), this is well within SQLite's comfort zone.
+For the test corpus (38 documents, 890 sections, 3,500+ chunks), this is well within SQLite's comfort zone.
 
 ---
 
 ## 6. Retrieval Pipeline
 
+### Overview
+
+Retrieval uses **reef overlap scoring**: the query is scored with lagoon to produce a reef profile, then chunks sharing those reefs are ranked by normalized dot product.
+
 ```
 Query text
     │
     ▼
-Score with lagoon: scorer.score(query) → TopicResult
+Score with lagoon:
+scorer.score(query)
     │
     ▼
-Extract query's top reefs (reef_ids + z_scores)
+Extract top reefs
+(positive z only)
     │
     ▼
-SQL: find chunks sharing those reefs, weighted by z_score overlap
+SQL reef overlap
+retrieval
     │
     ▼
-Apply filters: tags, confidence threshold, archipelago, reef constraints
+Join with sections + documents for context
     │
     ▼
-Join with documents table for citation metadata
-    │
-    ▼
-Return ranked results
+Return ranked results with section paths
 ```
 
 ### Query Flow
 
-1. **Score the query:** `scorer.score(query_text)` → `TopicResult` with top reefs, confidence, coverage
-2. **Reef-based retrieval:** Find chunks whose scored reefs overlap with the query's scored reefs
-3. **Filter:** Apply optional constraints (tags, min confidence, specific reefs/islands/archipelagos)
-4. **Rank:** Order by match quality (weighted reef overlap)
-5. **Hydrate:** Join with `documents` and `document_tags` for full citation metadata
+1. **Score the query:** `scorer.score(query_text, top_k=10)` → `TopicResult` with top reefs, confidence, coverage. Uses a fixed reef count (10) independent of the desired result count.
+2. **Filter query reefs:** Only reefs with positive z-scores are used. Negative z-scores indicate anti-correlation and would penalize chunks that happen to share those reefs.
+3. **Reef overlap retrieval:** Find chunks whose scored reefs overlap with the query's reefs. Scoring: `SUM(chunk_z * query_z) * sqrt(n_shared) / reef_l2_norm`. The `sqrt(n_shared)` factor rewards chunks sharing multiple reefs with the query. Dividing by `reef_l2_norm` (precomputed at ingestion) normalizes away text-length bias.
+4. **Filter:** Apply optional constraints (tags, min confidence).
+5. **Hydrate:** Join with `documents`, `sections`, and `document_tags` for full citation metadata including section path.
 
 ### Core Retrieval Query
 
-The fundamental retrieval operation: find chunks that share the query's top reefs, weighted by the product of query z-score and chunk z-score for each shared reef.
-
 ```sql
--- Given: query scored with top reefs [(reef_42, 5.12), (reef_17, 3.87), (reef_103, 2.91)]
-
+WITH qr(reef_id, query_z) AS (VALUES (42, 5.12), (17, 3.87), (103, 2.91))
 SELECT
-    c.id,
-    c.text,
-    c.document_id,
-    d.title AS document_title,
-    c.chunk_index,
-    c.start_char,
-    c.end_char,
-    c.confidence,
-    c.coverage,
-    c.top_reef_name,
-    SUM(cr.z_score * qr.query_z) AS match_score,
+    c.id, c.text, c.document_id, d.title AS document_title,
+    c.section_id, s.title AS section_title,
+    c.chunk_index, c.start_char, c.end_char,
+    c.confidence, c.coverage, c.top_reef_name,
+    CASE WHEN c.reef_l2_norm > 0
+         THEN SUM(cr.z_score * qr.query_z) * sqrt(COUNT(cr.reef_id)) / c.reef_l2_norm
+         ELSE 0.0
+    END AS match_score,
     COUNT(cr.reef_id) AS n_shared_reefs
 FROM chunks c
 JOIN chunk_reefs cr ON c.id = cr.chunk_id
-JOIN (
-    -- Query reef scores, passed as parameters
-    VALUES (42, 5.12), (17, 3.87), (103, 2.91)
-) AS qr(reef_id, query_z) ON cr.reef_id = qr.reef_id
+JOIN qr ON cr.reef_id = qr.reef_id
 JOIN documents d ON c.document_id = d.id
+JOIN sections s ON c.section_id = s.id
 GROUP BY c.id
 ORDER BY match_score DESC
-LIMIT ?;  -- top_k
+LIMIT ?;
 ```
-
-This query:
-- Joins `chunk_reefs` against the query's reef scores on `reef_id`
-- Weights each shared reef by `chunk_z_score * query_z_score` — a chunk that strongly matches the query's strong reefs ranks higher
-- Groups by chunk to aggregate across shared reefs
-- Returns `match_score` (sum of weighted overlaps) and `n_shared_reefs` (how many reefs overlap)
 
 ### Filtered Retrieval
 
-Filters compose naturally with SQL:
-
 ```sql
--- Add tag filter
+-- Tag filter
 JOIN document_tags dt ON d.id = dt.document_id AND dt.tag = 'biology'
 
--- Add confidence threshold
+-- Confidence threshold
 WHERE c.confidence > 1.5
-
--- Add archipelago filter (e.g., natural sciences only)
-WHERE c.arch_score_0 > c.arch_score_1
-  AND c.arch_score_0 > c.arch_score_2
-  AND c.arch_score_0 > c.arch_score_3
-
--- Add specific reef filter
-WHERE c.top_reef_id = 42
 ```
 
 ### Alternative Retrieval Strategies
@@ -852,12 +893,7 @@ LIMIT ?;
 
 ### What "Match Score" Means
 
-The `match_score = SUM(cr.z_score * qr.query_z)` is interpretable:
-- It rewards chunks that strongly activate the same reefs the query strongly activates
-- A chunk matching the query's top reef with high z-scores will score much higher than one matching a weak query reef weakly
-- `n_shared_reefs` tells you how broad the overlap is — a chunk sharing 5 reefs is a more robust match than one sharing 1
-
-This is fundamentally different from cosine similarity on opaque vectors. You can inspect *which reefs* contributed to the match score and explain the result in human-readable terms.
+The `match_score` is the normalized reef overlap: `SUM(chunk_z * query_z) * sqrt(n_shared) / reef_l2_norm`. Higher is better. Use `--scores` to inspect *which reefs* the query and chunk share, with both z-scores — full interpretability. The `section_path` field provides structural context: "Climate Change > Causes > Greenhouse Gases" instead of just "Climate Change, chunk #47".
 
 ---
 
@@ -1026,7 +1062,7 @@ No single formal RAG API standard exists. The closest reference points:
 | Component | Library | Notes |
 |-----------|---------|-------|
 | HTTP server | FastAPI + Uvicorn | Async, auto-generates OpenAPI |
-| Database | sqlite3 (stdlib) | No external DB dependency, no extensions |
+| Database | sqlite3 (stdlib) | No external DB dependency. No extensions required. |
 | Scoring | lagoon | Loaded once at startup, extended with custom vocabulary |
 | Validation | Pydantic | Request/response models |
 
@@ -1048,7 +1084,7 @@ These constraints ensure the Python prototype can be rewritten in Rust without a
 - **No ML model dependencies.** Lagoon's reef scores require no GPU, no PyTorch, no ONNX. Scoring is pure BM25 accumulation.
 - **Standard SQL.** All queries are portable SQLite SQL. No ORM magic, no Python-specific query builders. The core retrieval query uses standard JOINs, GROUP BY, and ORDER BY.
 - **Pydantic models map to serde structs.** Field names, types, and validation rules translate directly.
-- **No extensions.** Standard SQLite3 only — no sqlite-vec, no FTS5, no custom C extensions. The Rust port uses the same SQL against rusqlite.
+- **No SQLite extensions.** Standard SQLite only. No FTS5, no sqlite-vec, no custom C extensions.
 - **Quantization compatibility.** Custom word storage uses the same quantization scheme as lagoon's base vocabulary: u8 IDF (scale factor 51) and u16 BM25 (scale factor 8192). The `custom_words` and `custom_word_reefs` tables use INTEGER columns for these quantized values — same SQL schema works identically in Rust with rusqlite. No floating-point round-trip issues across languages.
 
 ---
@@ -1059,7 +1095,7 @@ These constraints ensure the Python prototype can be rewritten in Rust without a
 
 - **Formats:** Markdown (.md) and plain text (.txt)
 - **Storage:** Flat document store with string tags, structured reef metadata in normalized SQL tables
-- **Retrieval:** SQL-based reef overlap matching — join query reefs against chunk reefs
+- **Retrieval:** Reef overlap scoring
 - **API:** REST endpoints for document CRUD, search, status
 - **Chunking:** Lagoon topic-shift detection with configurable sensitivity and size limits
 - **Vocabulary extension:** Two-pass ingestion with context-based reef learning for unknown words
@@ -1073,7 +1109,7 @@ These constraints ensure the Python prototype can be rewritten in Rust without a
 | Collections / namespaces | Flat store is sufficient for the test corpus; add when multi-tenant use cases arise |
 | Authentication | V1 is single-user, local. Add API key auth when deploying as a shared service |
 | Traditional dense embeddings | Evaluate adding sentence-transformers as a complementary retrieval path later |
-| Hybrid search (FTS5 + reef) | Full-text keyword search via FTS5 is a natural complement; defer to V2 |
+| FTS5 hybrid retrieval | Reef overlap alone is the focus for evaluating lagoon's scoring. May add lexical search later if needed. |
 | Rate limiting | Not needed for single-user local deployment |
 
 ---
@@ -1146,8 +1182,8 @@ The test corpus is designed to exercise lagoon's 4 archipelagos with cross-domai
 
 After ingesting the full corpus with `shoal ingest-dir docs/`:
 
-- **28 documents**, **3,463 chunks** total
-- Largest documents: Origin of Species (476 chunks), Huckleberry Finn (414 chunks)
+- **38 documents**, **890 sections**, **3,500+ chunks** total
+- Largest documents: Origin of Species (476 chunks, 15 sections), Huckleberry Finn (414 chunks, 42 sections)
 - Smallest documents: Atmospheric River (33 chunks), Supply and Demand (34 chunks)
 
 Validation criteria:
@@ -1175,17 +1211,9 @@ Validation criteria:
 - **Association z-score threshold:** What mean weighted z-score qualifies a reef as "associated" with a custom word? Too low → noise reefs included, too high → too few associations, low IDF.
 
 ### Retrieval Quality
-- How well does weighted reef overlap (`SUM(cr.z_score * qr.query_z)`) perform as a ranking signal compared to cosine similarity on the full 207-dim vector? Empirical evaluation needed on the test corpus.
-- Should `n_shared_reefs` be a factor in the ranking (prefer broader matches), or is pure weighted overlap sufficient?
-- For low-confidence queries (generic text that doesn't converge on specific reefs), should retrieval fall back to a different strategy?
-
-### Hybrid Search (V2)
-SQLite's FTS5 extension supports full-text search with BM25 ranking. A hybrid approach would combine:
-1. Reef overlap matching (semantic matching via lagoon scores)
-2. FTS5 keyword matching (exact term matching)
-3. Score fusion to produce a final ranking
-
-This would handle cases where exact keyword matches matter (e.g., searching for a specific proper noun that lagoon's vocabulary doesn't contain).
+- How well does pure reef overlap perform across different query types? Empirical evaluation needed.
+- Should `n_shared_reefs` be weighted differently in the scoring formula?
+- Section-density scoring (post-processing to boost sections where many chunks matched) is designed in the schema (`n_chunks` field on sections) but not yet implemented as a retrieval signal.
 
 ### Traditional Embeddings (V2+)
 Adding sentence-transformer or similar dense embedding models as an additional retrieval path. This would provide:

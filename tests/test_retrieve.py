@@ -2,7 +2,7 @@
 
 from shoal._ingest import ingest_document
 from shoal._models import DocFormat
-from shoal._retrieve import search
+from shoal._retrieve import _is_stopword_query, search
 
 
 class TestRetrieve:
@@ -80,3 +80,59 @@ class TestRetrieve:
         assert qi.top_reef != ""
         assert len(qi.top_reefs) > 0
         assert qi.coverage > 0
+
+    def test_search_results_include_section_info(self, scorer, storage):
+        self._ingest_bio_doc(scorer, storage)
+        response = search(scorer, storage, "photosynthesis", top_k=5)
+        if response.results:
+            r = response.results[0]
+            assert r.section_title != ""
+            assert len(r.section_path) > 0
+
+    def test_stopword_query_returns_empty(self, scorer, storage):
+        self._ingest_bio_doc(scorer, storage)
+        response = search(scorer, storage, "the", top_k=5)
+        assert len(response.results) == 0
+        assert response.query_info.confidence == 0.0
+        assert response.query_info.top_reef == ""
+
+    def test_stopword_multi_word_returns_empty(self, scorer, storage):
+        self._ingest_bio_doc(scorer, storage)
+        response = search(scorer, storage, "the and or but", top_k=5)
+        assert len(response.results) == 0
+
+    def test_stopword_mixed_query_proceeds(self, scorer, storage):
+        self._ingest_bio_doc(scorer, storage)
+        # "the photosynthesis" has a real word — should NOT be blocked
+        response = search(scorer, storage, "the photosynthesis", top_k=5)
+        assert len(response.results) > 0
+
+    def test_top_k_is_maximum(self, scorer, storage):
+        self._ingest_bio_doc(scorer, storage)
+        self._ingest_geo_doc(scorer, storage)
+        response = search(scorer, storage, "photosynthesis", top_k=100)
+        # Should return fewer than 100 — top_k is a max, not a target
+        assert len(response.results) <= 100
+
+
+class TestStopWordDetection:
+    def test_single_stop_word(self):
+        assert _is_stopword_query("the") is True
+
+    def test_multiple_stop_words(self):
+        assert _is_stopword_query("the and or but") is True
+
+    def test_mixed_query(self):
+        assert _is_stopword_query("the photosynthesis") is False
+
+    def test_real_query(self):
+        assert _is_stopword_query("photosynthesis in plants") is False
+
+    def test_empty_query(self):
+        assert _is_stopword_query("") is True
+
+    def test_punctuation_only(self):
+        assert _is_stopword_query("... !!!") is True
+
+    def test_case_insensitive(self):
+        assert _is_stopword_query("The AND Or") is True

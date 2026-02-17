@@ -10,6 +10,7 @@ class TestEngine:
             s = engine.status()
             assert s["status"] == "ok"
             assert s["n_documents"] == 0
+            assert s["n_sections"] == 0
 
     def test_ingest_and_search(self, engine):
         text = (
@@ -25,10 +26,14 @@ class TestEngine:
             tags=["biology"],
         )
         assert result.n_chunks >= 1
+        assert result.n_sections >= 1
 
         response = engine.search("photosynthesis plants", top_k=5)
         assert len(response.results) > 0
         assert response.query_info.top_reef != ""
+        # Verify section info in results
+        if response.results:
+            assert response.results[0].section_title != ""
 
     def test_delete_document(self, engine):
         result = engine.ingest(
@@ -41,13 +46,16 @@ class TestEngine:
             format=DocFormat.plaintext,
         )
         assert engine.status()["n_documents"] == 1
+        assert engine.status()["n_sections"] >= 1
         assert engine.delete_document(result.id)
         assert engine.status()["n_documents"] == 0
+        assert engine.status()["n_sections"] == 0
 
     def test_status(self, engine):
         s = engine.status()
         assert s["status"] == "ok"
         assert s["n_documents"] == 0
+        assert s["n_sections"] == 0
         assert s["n_chunks"] == 0
         assert "lagoon_version" in s
         assert "db_path" in s
@@ -70,3 +78,17 @@ class TestEngine:
             format=DocFormat.plaintext,
         )
         assert engine.status()["n_documents"] == 2
+        assert engine.status()["n_sections"] >= 2
+
+    def test_ingest_n_sections_in_result(self, engine):
+        md = (
+            "# Title\n\n"
+            "## Section A\n\nBody A here.\n\n"
+            "## Section B\n\nBody B here.\n"
+        )
+        result = engine.ingest(
+            title="Multi-Section",
+            content=md,
+            format=DocFormat.markdown,
+        )
+        assert result.n_sections >= 2

@@ -7,6 +7,7 @@ from ._models import (
     QueryInfo,
     SearchResponse,
     SearchResult,
+    SectionData,
     SharedReef,
 )
 
@@ -20,5 +21,6 @@ __all__ = [
     "QueryInfo",
     "SearchResponse",
     "SearchResult",
+    "SectionData",
     "SharedReef",
 ]

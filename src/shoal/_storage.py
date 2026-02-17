@@ -4,10 +4,17 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import sqlite3
 from pathlib import Path
 
-from ._models import ChunkData, SearchResult, SharedReef
+from ._models import ChunkData, SearchResult, SectionData, SharedReef
+
+# Default number of reefs to keep per chunk after IDF-sorted filtering.
+# Reefs are sorted by z_score * idf (selectivity), and only the top K
+# are stored. This makes reef overlap discriminating: topically relevant
+# chunks share more of their distinctive reefs with the query.
+_DEFAULT_REEF_TOP_K = 38
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS documents (
@@ -28,9 +35,25 @@ CREATE TABLE IF NOT EXISTS document_tags (
 );
 CREATE INDEX IF NOT EXISTS idx_document_tags_tag ON document_tags(tag);
 
+CREATE TABLE IF NOT EXISTS sections (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+    parent_id   INTEGER REFERENCES sections(id) ON DELETE CASCADE,
+    title       TEXT NOT NULL,
+    depth       INTEGER NOT NULL DEFAULT 0,
+    position    INTEGER NOT NULL,
+    start_char  INTEGER NOT NULL,
+    end_char    INTEGER NOT NULL,
+    n_chunks    INTEGER NOT NULL DEFAULT 0,
+    metadata    TEXT DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_sections_document_id ON sections(document_id);
+CREATE INDEX IF NOT EXISTS idx_sections_parent_id ON sections(parent_id);
+
 CREATE TABLE IF NOT EXISTS chunks (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     document_id     INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+    section_id      INTEGER NOT NULL REFERENCES sections(id) ON DELETE CASCADE,
     chunk_index     INTEGER NOT NULL,
     text            TEXT NOT NULL,
     start_char      INTEGER NOT NULL,
@@ -45,10 +68,13 @@ CREATE TABLE IF NOT EXISTS chunks (
     arch_score_1    REAL NOT NULL,
     arch_score_2    REAL NOT NULL,
     arch_score_3    REAL NOT NULL,
+    arch_score_4    REAL NOT NULL DEFAULT 0.0,
+    reef_l2_norm    REAL NOT NULL DEFAULT 0.0,
     metadata        TEXT DEFAULT '{}',
     UNIQUE(document_id, chunk_index)
 );
 CREATE INDEX IF NOT EXISTS idx_chunks_document_id ON chunks(document_id);
+CREATE INDEX IF NOT EXISTS idx_chunks_section_id ON chunks(section_id);
 CREATE INDEX IF NOT EXISTS idx_chunks_top_reef_id ON chunks(top_reef_id);
 CREATE INDEX IF NOT EXISTS idx_chunks_confidence ON chunks(confidence);
 
@@ -235,21 +261,146 @@ class Storage:
         ).fetchone()
         return row["n"]
 
+    def count_sections(self) -> int:
+        row = self.conn.execute("SELECT COUNT(*) AS n FROM sections").fetchone()
+        return row["n"]
+
+    # ── Section operations ──
+
+    def insert_sections(self, doc_id: int, sections: list[SectionData]) -> list[int]:
+        """Insert a section tree in order, resolving parent_index to parent_id.
+
+        Returns list of section IDs matching the input list order.
+        """
+        section_ids: list[int] = []
+        for section in sections:
+            parent_id = None
+            if section.parent_index is not None:
+                parent_id = section_ids[section.parent_index]
+
+            cur = self.conn.execute(
+                "INSERT INTO sections "
+                "(document_id, parent_id, title, depth, position, start_char, end_char, metadata) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    doc_id,
+                    parent_id,
+                    section.title,
+                    section.depth,
+                    section.position,
+                    section.start_char,
+                    section.end_char,
+                    json.dumps(section.metadata),
+                ),
+            )
+            section_ids.append(cur.lastrowid)  # type: ignore[arg-type]
+
+        self.conn.commit()
+        return section_ids
+
+    def update_section_chunk_count(self, section_id: int, n_chunks: int) -> None:
+        """Update the n_chunks count for a section."""
+        self.conn.execute(
+            "UPDATE sections SET n_chunks = ? WHERE id = ?",
+            (n_chunks, section_id),
+        )
+        self.conn.commit()
+
+    def get_sections_for_document(self, doc_id: int) -> list[dict]:
+        """Return all sections for a document, ordered by depth then position."""
+        rows = self.conn.execute(
+            "SELECT * FROM sections WHERE document_id = ? ORDER BY depth, position",
+            (doc_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_section_path(self, section_id: int) -> list[str]:
+        """Walk the parent_id chain to build a section path.
+
+        Returns list like ["Global temperature rise", "Warming since..."].
+        """
+        path: list[str] = []
+        current_id: int | None = section_id
+        while current_id is not None:
+            row = self.conn.execute(
+                "SELECT id, parent_id, title FROM sections WHERE id = ?",
+                (current_id,),
+            ).fetchone()
+            if row is None:
+                break
+            path.append(row["title"])
+            current_id = row["parent_id"]
+        path.reverse()
+        return path
+
+    # ── Reef IDF ──
+
+    def get_reef_idf(self) -> dict[int, float]:
+        """Compute IDF for each reef from current chunk_reefs data.
+
+        IDF = log(N / df) where N = total chunks, df = chunks containing this reef.
+        Returns empty dict if no chunks exist yet (first document).
+        """
+        n_chunks = self.count_chunks()
+        if n_chunks == 0:
+            return {}
+
+        rows = self.conn.execute(
+            "SELECT reef_id, COUNT(DISTINCT chunk_id) AS df FROM chunk_reefs GROUP BY reef_id"
+        ).fetchall()
+        return {row["reef_id"]: math.log(n_chunks / row["df"]) for row in rows}
+
     # ── Chunk insertion ──
 
-    def insert_chunks(self, doc_id: int, chunks: list[ChunkData]) -> list[int]:
-        """Insert chunks with their reef and island scores. Returns list of chunk ids."""
+    def insert_chunks(
+        self,
+        doc_id: int,
+        chunks: list[ChunkData],
+        section_ids: list[int] | None = None,
+        reef_top_k: int = _DEFAULT_REEF_TOP_K,
+    ) -> list[int]:
+        """Insert chunks with their reef and island scores. Returns list of chunk ids.
+
+        If section_ids is provided, each chunk's section_index is used to look up
+        the actual section_id from the list.
+
+        Reef filtering: each chunk's reefs are sorted by z_score * IDF
+        (selectivity), and only the top reef_top_k are stored. This keeps
+        the most corpus-distinctive reefs per chunk, making reef overlap
+        discriminating for retrieval.
+        """
+        # Compute current reef IDF for selectivity-based filtering
+        reef_idf = self.get_reef_idf()
+
         chunk_ids = []
         for chunk in chunks:
             arch = chunk.arch_scores
+
+            # Resolve section_id
+            if section_ids is not None:
+                section_id = section_ids[chunk.section_index]
+            else:
+                section_id = chunk.section_index  # fallback: treat as direct id
+
+            # IDF-sorted reef filtering: keep top-K by z * idf
+            filtered_reefs = self._filter_reefs_by_selectivity(
+                chunk.top_reefs, reef_idf, reef_top_k,
+            )
+
+            # Compute L2 norm from kept reefs
+            reef_l2_norm = math.sqrt(
+                sum(z ** 2 for _, _, z, _, _ in filtered_reefs)
+            ) if filtered_reefs else 0.0
+
             cur = self.conn.execute(
                 "INSERT INTO chunks "
-                "(document_id, chunk_index, text, start_char, end_char, sentence_count, "
+                "(document_id, section_id, chunk_index, text, start_char, end_char, sentence_count, "
                 "confidence, coverage, matched_words, top_reef_id, top_reef_name, "
-                "arch_score_0, arch_score_1, arch_score_2, arch_score_3, metadata) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "arch_score_0, arch_score_1, arch_score_2, arch_score_3, arch_score_4, reef_l2_norm, metadata) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     doc_id,
+                    section_id,
                     chunk.chunk_index,
                     chunk.text,
                     chunk.start_char,
@@ -264,14 +415,16 @@ class Storage:
                     arch[1] if len(arch) > 1 else 0.0,
                     arch[2] if len(arch) > 2 else 0.0,
                     arch[3] if len(arch) > 3 else 0.0,
+                    arch[4] if len(arch) > 4 else 0.0,
+                    reef_l2_norm,
                     json.dumps(chunk.metadata),
                 ),
             )
             chunk_id = cur.lastrowid
             chunk_ids.append(chunk_id)  # type: ignore[arg-type]
 
-            # Insert chunk_reefs rows
-            for rank, (reef_id, reef_name, z_score, raw_bm25, n_words) in enumerate(chunk.top_reefs):
+            # Insert filtered chunk_reefs rows
+            for rank, (reef_id, reef_name, z_score, raw_bm25, n_words) in enumerate(filtered_reefs):
                 self.conn.execute(
                     "INSERT INTO chunk_reefs "
                     "(chunk_id, reef_id, reef_name, z_score, raw_bm25, n_contributing_words, rank) "
@@ -291,6 +444,37 @@ class Storage:
         self.conn.commit()
         return chunk_ids
 
+    @staticmethod
+    def _filter_reefs_by_selectivity(
+        top_reefs: list[tuple[int, str, float, float, int]],
+        reef_idf: dict[int, float],
+        top_k: int,
+    ) -> list[tuple[int, str, float, float, int]]:
+        """Filter chunk reefs to the top-K most corpus-distinctive.
+
+        Sorts reefs by z_score * IDF (selectivity), keeping those that are
+        both strong in this chunk AND rare across the corpus. Falls back to
+        raw z_score sorting when IDF data is unavailable (first document).
+        """
+        if len(top_reefs) <= top_k:
+            return top_reefs
+
+        if reef_idf:
+            # Unseen reefs get max IDF * 1.5: they're rarer than the rarest
+            # known reef, so they should be FAVORED for storage, not excluded.
+            default_idf = max(reef_idf.values()) * 1.5
+            # Sort by selectivity = z_score * idf, descending
+            scored = [
+                (reef_id, name, z, bm25, nw, z * reef_idf.get(reef_id, default_idf))
+                for reef_id, name, z, bm25, nw in top_reefs
+            ]
+            scored.sort(key=lambda x: x[5], reverse=True)
+            return [(rid, name, z, bm25, nw) for rid, name, z, bm25, nw, _ in scored[:top_k]]
+        else:
+            # No IDF data yet — fall back to raw z-score ordering
+            sorted_reefs = sorted(top_reefs, key=lambda x: x[2], reverse=True)
+            return sorted_reefs[:top_k]
+
     # ── Retrieval ──
 
     def search_by_reef_overlap(
@@ -302,7 +486,14 @@ class Storage:
         min_confidence: float | None = None,
         include_scores: bool = False,
     ) -> list[SearchResult]:
-        """Find chunks sharing query reefs, ranked by weighted z-score overlap."""
+        """Find chunks sharing query reefs, ranked by normalized reef overlap.
+
+        Scoring: SUM(chunk_z * query_z) * sqrt(n_shared) / reef_l2_norm
+
+        The sqrt(n_shared) factor rewards chunks sharing multiple reefs with
+        the query. Dividing by reef_l2_norm (precomputed at ingestion) normalizes
+        away text-length bias without any query-time subqueries.
+        """
         if not query_reefs:
             return []
 
@@ -313,18 +504,24 @@ class Storage:
             params.extend([reef_id, z_score])
 
         # Build SQL dynamically based on filters
+        # Scoring: dot_product * sqrt(n_shared) / reef_l2_norm
         sql = f"""
         WITH qr(reef_id, query_z) AS (VALUES {value_placeholders})
         SELECT c.id, c.text, c.document_id, d.title AS document_title,
+               c.section_id, s.title AS section_title,
                c.chunk_index, c.start_char, c.end_char,
                c.confidence, c.coverage, c.top_reef_name,
-               c.arch_score_0, c.arch_score_1, c.arch_score_2, c.arch_score_3,
-               SUM(cr.z_score * qr.query_z) AS match_score,
+               c.arch_score_0, c.arch_score_1, c.arch_score_2, c.arch_score_3, c.arch_score_4,
+               CASE WHEN c.reef_l2_norm > 0
+                    THEN SUM(cr.z_score * qr.query_z) * sqrt(COUNT(cr.reef_id)) / c.reef_l2_norm
+                    ELSE 0.0
+               END AS match_score,
                COUNT(cr.reef_id) AS n_shared_reefs
         FROM chunks c
         JOIN chunk_reefs cr ON c.id = cr.chunk_id
         JOIN qr ON cr.reef_id = qr.reef_id
         JOIN documents d ON c.document_id = d.id
+        JOIN sections s ON c.section_id = s.id
         """
 
         where_clauses = []
@@ -355,6 +552,9 @@ class Storage:
                 # Fetch individual shared reef details
                 shared = self._get_shared_reefs(row["id"], query_reefs)
 
+            # Get section path
+            section_path = self.get_section_path(row["section_id"])
+
             results.append(SearchResult(
                 text=row["text"],
                 match_score=row["match_score"],
@@ -367,9 +567,13 @@ class Storage:
                 confidence=row["confidence"],
                 coverage=row["coverage"],
                 top_reef_name=row["top_reef_name"],
+                chunk_id=row["id"],
+                section_title=row["section_title"],
+                section_path=section_path,
                 arch_scores=[
                     row["arch_score_0"], row["arch_score_1"],
                     row["arch_score_2"], row["arch_score_3"],
+                    row["arch_score_4"],
                 ],
                 shared_reefs=shared,
             ))

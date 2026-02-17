@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from typing import TYPE_CHECKING
 
-from ._models import ChunkData, DocFormat, IngestResult, ParsedSection
-from ._parsers import parse_document
+from ._models import ChunkData, DocFormat, IngestResult, SectionData
+from ._parsers import parse_sections
 from ._storage import Storage
 
 if TYPE_CHECKING:
@@ -25,9 +26,14 @@ def ingest_document(
     sensitivity: float = 1.0,
     smooth_window: int = 2,
     min_chunk_sentences: int = 2,
-    max_chunk_sentences: int = 30,
+    max_chunk_sentences: int = 12,
+    min_chunk_chars: int = 175,
+    max_section_depth: int = 2,
+    min_section_length: int = 200,
+    min_reef_z: float = 2.0,
+    reef_top_k: int = 38,
 ) -> IngestResult:
-    """Ingest a document: parse, analyze with lagoon, store in SQLite.
+    """Ingest a document: parse sections, analyze with lagoon, store in SQLite.
 
     Phase 1 implementation: single pass (no vocabulary extension).
     """
@@ -46,48 +52,82 @@ def ingest_document(
         storage.set_tags(doc_id, tag_list)
 
     # 3. Parse into sections
-    sections = parse_document(content, fmt)
+    sections = parse_sections(
+        content, fmt,
+        max_section_depth=max_section_depth,
+        min_section_length=min_section_length,
+    )
 
-    # 4. Analyze each section and build chunks
+    if not sections:
+        return IngestResult(
+            id=doc_id,
+            title=title,
+            n_chunks=0,
+            n_sections=0,
+            tags=tag_list,
+        )
+
+    # 4. Insert section tree
+    section_ids = storage.insert_sections(doc_id, sections)
+
+    # 5. Analyze each section and build chunks
     all_chunks: list[ChunkData] = []
     chunk_index = 0
 
-    for section in sections:
+    for sec_idx, section in enumerate(sections):
         section_chunks = _analyze_section(
             scorer=scorer,
             section=section,
+            section_index=sec_idx,
             chunk_index_start=chunk_index,
             sensitivity=sensitivity,
             smooth_window=smooth_window,
             min_chunk_sentences=min_chunk_sentences,
             max_chunk_sentences=max_chunk_sentences,
+            min_reef_z=min_reef_z,
         )
         all_chunks.extend(section_chunks)
         chunk_index += len(section_chunks)
 
-    # 5. Store chunks
+    # 6. Filter out tiny chunks that lack meaningful reef signal
+    if min_chunk_chars > 0:
+        all_chunks = [c for c in all_chunks if len(c.text) >= min_chunk_chars]
+        for i, chunk in enumerate(all_chunks):
+            chunk.chunk_index = i
+
+    # 7. Store chunks
     if all_chunks:
-        storage.insert_chunks(doc_id, all_chunks)
+        storage.insert_chunks(doc_id, all_chunks, section_ids=section_ids, reef_top_k=reef_top_k)
+
+    # 8. Update section chunk counts
+    chunk_counts: Counter[int] = Counter()
+    for chunk in all_chunks:
+        chunk_counts[chunk.section_index] += 1
+    for sec_idx, count in chunk_counts.items():
+        storage.update_section_chunk_count(section_ids[sec_idx], count)
 
     return IngestResult(
         id=doc_id,
         title=title,
         n_chunks=len(all_chunks),
+        n_sections=len(sections),
         tags=tag_list,
     )
 
 
 def _analyze_section(
     scorer: ReefScorer,
-    section: ParsedSection,
+    section: SectionData,
+    section_index: int,
     chunk_index_start: int,
     sensitivity: float,
     smooth_window: int,
     min_chunk_sentences: int,
     max_chunk_sentences: int,
+    min_reef_z: float = 2.0,
 ) -> list[ChunkData]:
     """Analyze a section with lagoon and return ChunkData objects."""
-    text = section.text
+    text = section.analysis_text
     if not text.strip():
         return []
 
@@ -97,6 +137,7 @@ def _analyze_section(
         smooth_window=smooth_window,
         min_chunk_sentences=min_chunk_sentences,
         max_chunk_sentences=max_chunk_sentences,
+        min_reef_z=min_reef_z,
     )
 
     chunks: list[ChunkData] = []
@@ -148,7 +189,8 @@ def _analyze_section(
             arch_scores=list(topic.arch_scores),
             top_reefs=top_reefs,
             top_islands=top_islands,
-            metadata={"headers": section.header_hierarchy},
+            section_index=section_index,
+            metadata={"section_title": section.title},
         ))
 
     return chunks
