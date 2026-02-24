@@ -47,10 +47,14 @@ class Engine:
 
     def start(self) -> None:
         """Load lagoon scorer, connect to storage, inject custom vocabulary."""
+        print("Loading lagoon scorer...")
         self._scorer = lagoon.load(self._lagoon_data_dir)
+        print("Connecting to storage...")
         self._storage = Storage(self._db_path)
         self._storage.connect()
+        print("Injecting custom vocabulary...")
         inject_custom_vocabulary_at_startup(self._scorer, self._storage)
+        print("Engine started.")
 
     def close(self) -> None:
         """Close storage connection."""

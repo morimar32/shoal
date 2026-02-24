@@ -24,20 +24,35 @@ _ASSOCIATION_Z_THRESHOLD = 1.5
 _RELATIVE_Z_CUTOFF = 0.3  # keep reefs with mean_z >= 30% of max mean_z
 _MAX_ASSOCIATED_REEFS = 15
 _MAX_REEFS_PER_OBSERVATION = 20
+_REEF_SIZE_ADJUSTMENT_CAP = 3.0  # max boost for small reefs in size adjustment
 
 
 def inject_custom_vocabulary_at_startup(scorer: ReefScorer, storage: Storage) -> int:
     """Load custom vocabulary from SQLite and inject into the scorer.
+
+    Uses stored reef_weights (pre-computed weight_q values) directly,
+    avoiding recalculation on every startup. Falls back to recomputing
+    via calc_custom_weight if stored weights are all zero (old DB format).
 
     Returns the number of custom words injected.
     """
     custom_words = storage.load_custom_vocabulary()
     injected = 0
     for cw in custom_words:
+        reef_weights = cw["reef_weights"]  # [(reef_id, bm25_q), ...]
+
+        # Migration: if all weight_q are 0, recompute from associations
+        if reef_weights and all(wq == 0 for _, wq in reef_weights):
+            reef_weights = [
+                (rid, scorer.calc_custom_weight(rid, strength))
+                for rid, strength in cw["reef_associations"]
+            ]
+
         try:
             scorer.add_custom_word(
                 cw["word"],
-                cw["reef_associations"],
+                reef_weights,
+                idf_q=cw["idf_q"],
                 specificity=cw["specificity"],
                 tag=cw["id"],
             )
@@ -175,6 +190,15 @@ def build_vocabulary(
             for rid in reef_z_sums
         }
 
+        # Adjust for reef size: large reefs fire on everything,
+        # small domain-specific reefs are more informative
+        reef_wc = scorer.reef_word_counts
+        avg_rw = scorer.avg_reef_words
+        for rid in mean_z:
+            nw = reef_wc[rid] if rid < len(reef_wc) else avg_rw
+            adjustment = min(avg_rw / max(nw, 1), _REEF_SIZE_ADJUSTMENT_CAP)
+            mean_z[rid] *= adjustment
+
         # Keep reefs where mean_z >= absolute threshold
         qualifying = {
             rid: mz for rid, mz in mean_z.items()
@@ -220,19 +244,29 @@ def build_vocabulary(
         else:
             specificity = -2
 
+        # Pre-compute IDF and per-reef calibrated weights
+        idf_q = scorer.calc_custom_idf(n_reefs)
+        reef_weights = [
+            (rid, scorer.calc_custom_weight(rid, strength))
+            for rid, strength in reef_associations
+        ]
+
         # Inject into scorer with tag=0 (will update after persisting)
         try:
             word_info = scorer.add_custom_word(
-                word, reef_associations, specificity=specificity, tag=0,
+                word, reef_weights,
+                idf_q=idf_q, specificity=specificity, tag=0,
             )
         except ValueError:
             # Hash collision or word somehow became known
             continue
 
-        # Persist to storage and get stable cw_id
-        reef_entries = []
-        for rid, strength in reef_associations:
-            reef_entries.append((rid, 0, strength))  # bm25_q=0 placeholder
+        # Build reef entries for storage: (reef_id, bm25_q, strength)
+        reef_entries = [
+            (rid, weight_q, strength)
+            for (rid, weight_q), (_, strength)
+            in zip(reef_weights, reef_associations)
+        ]
 
         cw_id = storage.insert_custom_word(
             word=word,

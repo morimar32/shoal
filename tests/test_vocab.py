@@ -18,6 +18,10 @@ def _make_mock_scorer():
     scorer = MagicMock()
     scorer.lookup_word.return_value = None  # word not known
     scorer.get_word_tags.return_value = {}
+    scorer.calc_custom_idf.return_value = 148
+    scorer.calc_custom_weight.side_effect = lambda rid, strength: round(5000 * strength)
+    scorer.reef_word_counts = [4000] * 444  # uniform reef sizes for tests
+    scorer.avg_reef_words = 4000.0
     return scorer
 
 
@@ -28,9 +32,34 @@ class TestInjectCustomVocabularyAtStartup:
         assert count == 0
         scorer.add_custom_word.assert_not_called()
 
-    def test_inject_words(self, storage):
+    def test_inject_words_with_stored_weights(self, storage):
         scorer = _make_mock_scorer()
-        # Pre-populate storage with a custom word
+        # Pre-populate storage with a custom word that has bm25_q values
+        doc_id = storage.insert_document("Doc", "text", "plaintext")
+        storage.insert_custom_word(
+            word="photovoltaic",
+            word_hash=12345,
+            word_id=100,
+            specificity=2,
+            idf_q=10,
+            n_occurrences=3,
+            reef_entries=[(42, 4500, 0.9), (17, 2500, 0.5)],
+        )
+        count = inject_custom_vocabulary_at_startup(scorer, storage)
+        assert count == 1
+        scorer.add_custom_word.assert_called_once()
+        call_args = scorer.add_custom_word.call_args
+        assert call_args[0][0] == "photovoltaic"
+        # reef_weights should be the stored (reef_id, bm25_q) tuples
+        assert set(call_args[0][1]) == {(42, 4500), (17, 2500)}
+        assert call_args[1]["idf_q"] == 10
+        assert call_args[1]["specificity"] == 2
+        # calc_custom_weight should NOT have been called (stored weights used)
+        scorer.calc_custom_weight.assert_not_called()
+
+    def test_inject_words_migration_zero_weights(self, storage):
+        scorer = _make_mock_scorer()
+        # Old DB format: bm25_q = 0 for all entries
         doc_id = storage.insert_document("Doc", "text", "plaintext")
         storage.insert_custom_word(
             word="photovoltaic",
@@ -43,11 +72,8 @@ class TestInjectCustomVocabularyAtStartup:
         )
         count = inject_custom_vocabulary_at_startup(scorer, storage)
         assert count == 1
-        scorer.add_custom_word.assert_called_once()
-        call_args = scorer.add_custom_word.call_args
-        assert call_args[0][0] == "photovoltaic"
-        assert len(call_args[0][1]) == 2  # 2 reef associations
-        assert call_args[1]["specificity"] == 2
+        # calc_custom_weight should have been called (migration path)
+        assert scorer.calc_custom_weight.call_count == 2
 
     def test_skip_on_value_error(self, storage):
         scorer = _make_mock_scorer()
@@ -144,7 +170,7 @@ class TestBuildVocabulary:
         mock_word_info = MagicMock()
         mock_word_info.word_hash = 12345
         mock_word_info.word_id = 100
-        mock_word_info.idf_q = 10
+        mock_word_info.idf_q = 148
         scorer.add_custom_word.return_value = mock_word_info
 
         # Insert enough observations (>= 2 for short doc)
@@ -163,6 +189,12 @@ class TestBuildVocabulary:
         n_new = build_vocabulary(scorer, storage, doc_id, total_word_count=100)
         assert n_new == 1
         scorer.add_custom_word.assert_called_once()
+        # Verify helpers were called
+        scorer.calc_custom_idf.assert_called_once()
+        scorer.calc_custom_weight.assert_called()
+        # Verify reef_weights (not reef_associations) passed
+        call_args = scorer.add_custom_word.call_args
+        assert "idf_q" in call_args[1]
         # Verify stored in DB
         assert storage.count_custom_words() == 1
 

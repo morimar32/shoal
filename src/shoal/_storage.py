@@ -16,6 +16,11 @@ from ._models import ChunkData, SearchResult, SectionData, SharedReef, WordObser
 # chunks share more of their distinctive reefs with the query.
 _DEFAULT_REEF_TOP_K = 38
 
+# Minimum L2 norm used in scoring denominator. Short/stub chunks with very
+# low reef L2 norms get disproportionately high scores because the formula
+# divides by L2 norm. This floor prevents that inflation.
+_L2_NORM_FLOOR = 100.0
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS documents (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -64,11 +69,7 @@ CREATE TABLE IF NOT EXISTS chunks (
     matched_words   INTEGER NOT NULL,
     top_reef_id     INTEGER NOT NULL,
     top_reef_name   TEXT NOT NULL,
-    arch_score_0    REAL NOT NULL,
-    arch_score_1    REAL NOT NULL,
-    arch_score_2    REAL NOT NULL,
-    arch_score_3    REAL NOT NULL,
-    arch_score_4    REAL NOT NULL DEFAULT 0.0,
+    arch_scores     TEXT NOT NULL DEFAULT '[]',
     reef_l2_norm    REAL NOT NULL DEFAULT 0.0,
     metadata        TEXT DEFAULT '{}',
     UNIQUE(document_id, chunk_index)
@@ -404,8 +405,8 @@ class Storage:
                 "INSERT INTO chunks "
                 "(document_id, section_id, chunk_index, text, start_char, end_char, sentence_count, "
                 "confidence, coverage, matched_words, top_reef_id, top_reef_name, "
-                "arch_score_0, arch_score_1, arch_score_2, arch_score_3, arch_score_4, reef_l2_norm, metadata) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "arch_scores, reef_l2_norm, metadata) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     doc_id,
                     section_id,
@@ -419,11 +420,7 @@ class Storage:
                     chunk.matched_words,
                     chunk.top_reef_id,
                     chunk.top_reef_name,
-                    arch[0] if len(arch) > 0 else 0.0,
-                    arch[1] if len(arch) > 1 else 0.0,
-                    arch[2] if len(arch) > 2 else 0.0,
-                    arch[3] if len(arch) > 3 else 0.0,
-                    arch[4] if len(arch) > 4 else 0.0,
+                    json.dumps(arch),
                     reef_l2_norm,
                     json.dumps(chunk.metadata),
                 ),
@@ -524,7 +521,7 @@ class Storage:
                c.section_id, s.title AS section_title,
                c.chunk_index, c.start_char, c.end_char,
                c.confidence, c.coverage, c.top_reef_name,
-               c.arch_score_0, c.arch_score_1, c.arch_score_2, c.arch_score_3, c.arch_score_4,
+               c.arch_scores,
                CASE WHEN c.reef_l2_norm > 0
                     THEN SUM(cr.z_score * qr.query_z * qr.reef_idf) * sqrt(COUNT(cr.reef_id)) / c.reef_l2_norm
                     ELSE 0.0
@@ -583,11 +580,7 @@ class Storage:
                 chunk_id=row["id"],
                 section_title=row["section_title"],
                 section_path=section_path,
-                arch_scores=[
-                    row["arch_score_0"], row["arch_score_1"],
-                    row["arch_score_2"], row["arch_score_3"],
-                    row["arch_score_4"],
-                ],
+                arch_scores=json.loads(row["arch_scores"]),
                 shared_reefs=shared,
             ))
 
@@ -718,7 +711,7 @@ class Storage:
         result = []
         for w in words:
             reefs = self.conn.execute(
-                "SELECT reef_id, association_strength FROM custom_word_reefs WHERE word_id = ?",
+                "SELECT reef_id, bm25_q, association_strength FROM custom_word_reefs WHERE word_id = ?",
                 (w["word_id"],),
             ).fetchall()
             result.append({
@@ -730,6 +723,7 @@ class Storage:
                 "idf_q": w["idf_q"],
                 "n_occurrences": w["n_occurrences"],
                 "reef_associations": [(r["reef_id"], r["association_strength"]) for r in reefs],
+                "reef_weights": [(r["reef_id"], r["bm25_q"]) for r in reefs],
             })
         return result
 
@@ -795,10 +789,10 @@ class Storage:
                c.section_id, s.title AS section_title,
                c.chunk_index, c.start_char, c.end_char,
                c.confidence, c.coverage, c.top_reef_name,
-               c.arch_score_0, c.arch_score_1, c.arch_score_2, c.arch_score_3, c.arch_score_4,
+               c.arch_scores,
                c.reef_l2_norm,
                CASE WHEN c.reef_l2_norm > 0
-                    THEN SUM(cr.z_score * qr.query_z * qr.reef_idf) * sqrt(COUNT(cr.reef_id)) / c.reef_l2_norm
+                    THEN SUM(cr.z_score * qr.query_z * qr.reef_idf) * sqrt(COUNT(cr.reef_id)) / MAX(c.reef_l2_norm, {_L2_NORM_FLOOR})
                     ELSE 0.0
                END AS match_score,
                COUNT(cr.reef_id) AS n_shared_reefs
@@ -832,11 +826,7 @@ class Storage:
                 chunk_id=row["id"],
                 section_title=row["section_title"],
                 section_path=section_path,
-                arch_scores=[
-                    row["arch_score_0"], row["arch_score_1"],
-                    row["arch_score_2"], row["arch_score_3"],
-                    row["arch_score_4"],
-                ],
+                arch_scores=json.loads(row["arch_scores"]),
             ))
         return results
 

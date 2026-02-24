@@ -358,7 +358,7 @@ def _build_chunks_from_segments(
         abs_end = section.start_char + end_char
 
         top_reefs = [
-            (r.reef_id, r.name, r.z_score, r.raw_bm25, r.n_contributing_words)
+            (r.reef_id, r.name, r.z_score, r.raw_score, r.n_contributing_words)
             for r in topic.top_reefs
         ]
         top_islands = [

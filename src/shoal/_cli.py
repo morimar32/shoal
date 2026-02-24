@@ -54,15 +54,7 @@ _TREE_BRANCH = "\u251c" # ├
 _TREE_LAST = "\u2514"   # └
 _TREE_PIPE = "\u2502"   # │
 
-_ARCH_NAMES = [
-    "natural sciences & taxonomy",
-    "physical world & materiality",
-    "abstract processes & systems",
-    "social order & assessment",
-    "specialized activities & practices",
-]
-
-_ARCH_SYMBOLS = ["N", "P", "A", "S", "Sp"]
+_ARCH_SYMBOLS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 
 
 def _c(code: str, text: str) -> str:
@@ -101,26 +93,29 @@ def _score_bar(score: float, max_score: float, width: int = 20) -> str:
 
 
 def _dominant_arch(arch_scores: list[float]) -> tuple[int, str]:
-    """Return the index and name of the dominant archipelago."""
+    """Return the index and label of the dominant archipelago."""
     if not arch_scores:
-        return 0, _ARCH_NAMES[0]
+        return 0, "A0"
     idx = max(range(len(arch_scores)), key=lambda i: arch_scores[i])
-    return idx, _ARCH_NAMES[idx]
+    sym = _ARCH_SYMBOLS[idx] if idx < len(_ARCH_SYMBOLS) else str(idx)
+    return idx, f"arch-{sym}"
 
 
 def _arch_sparkline(arch_scores: list[float]) -> str:
     """Render a compact sparkline of arch scores with labels."""
-    if not arch_scores or len(arch_scores) < 5:
+    if not arch_scores:
         return ""
     total = sum(arch_scores) or 1.0
+    # Show only archs with >5% contribution to keep it readable
     parts = []
-    for i, (sym, score) in enumerate(zip(_ARCH_SYMBOLS, arch_scores)):
+    for i, score in enumerate(arch_scores):
         pct = score / total * 100
+        sym = _ARCH_SYMBOLS[i] if i < len(_ARCH_SYMBOLS) else str(i)
         if pct >= 30:
             parts.append(_c(_ARCH_BOLD, f"{sym}:{pct:.0f}%"))
         elif pct >= 15:
             parts.append(_c(_ARCH, f"{sym}:{pct:.0f}%"))
-        else:
+        elif pct >= 5:
             parts.append(_c(_LABEL, f"{sym}:{pct:.0f}%"))
     return " ".join(parts)
 

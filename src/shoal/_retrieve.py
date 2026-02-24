@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING
 
 from lagoon import STOP_WORDS
@@ -14,8 +15,10 @@ if TYPE_CHECKING:
 
 
 _QUERY_REEF_COUNT = 10  # number of reefs to use from scorer (independent of result count)
-_MIN_REEF_CONFIDENCE = 0.1  # reef-only results require at least this query confidence
-_LIGHTNING_ROD_BOOST = 1.3  # score multiplier for chunks containing custom query words
+_MIN_REEF_CONFIDENCE = 0.5  # reef-only results require at least this query confidence (top raw BM25)
+_LIGHTNING_ROD_BASE_BOOST = 1.15  # base multiplier for lightning rod candidates
+_LIGHTNING_ROD_TERM_BOOST = 0.20  # additional multiplier scaled by query-term frequency score
+_LIGHTNING_ROD_DOC_BOOST = 0.25   # additional multiplier for document-level concentration
 _LIGHTNING_ROD_LIMIT = 50   # max candidate chunks from word lookup
 
 
@@ -102,9 +105,42 @@ def search(
             lightning_results = storage.score_chunks_by_reef_overlap(
                 candidate_chunk_ids, query_reefs,
             )
-            # Apply boost
+            # Apply boost scaled by query-term overlap:
+            # chunks containing more query words get a stronger boost
+            query_tokens = {
+                w.lower() for w in query.split()
+                if any(c.isalnum() for c in w)
+            } - STOP_WORDS
+            n_query_tokens = max(len(query_tokens), 1)
+
+            # Document concentration: count how many candidate chunks
+            # come from each document. More chunks → stronger signal
+            # that the document is about the query's custom words.
+            doc_chunk_counts: dict[int, int] = {}
             for lr in lightning_results:
-                lr.match_score *= _LIGHTNING_ROD_BOOST
+                doc_chunk_counts[lr.document_id] = (
+                    doc_chunk_counts.get(lr.document_id, 0) + 1
+                )
+            max_doc_chunks = max(doc_chunk_counts.values()) if doc_chunk_counts else 1
+
+            for lr in lightning_results:
+                chunk_lower = lr.text.lower()
+                # Frequency-weighted: log(1+count) rewards repeated
+                # occurrences of query terms, not just binary presence
+                freq_score = sum(
+                    math.log1p(chunk_lower.count(t))
+                    for t in query_tokens
+                ) / n_query_tokens
+                # Document concentration: fraction of candidate chunks
+                # from this document vs the most represented document
+                doc_concentration = (
+                    doc_chunk_counts[lr.document_id] / max_doc_chunks
+                )
+                lr.match_score *= (
+                    _LIGHTNING_ROD_BASE_BOOST
+                    + _LIGHTNING_ROD_TERM_BOOST * freq_score
+                    + _LIGHTNING_ROD_DOC_BOOST * doc_concentration
+                )
             lightning_chunk_ids = {r.chunk_id for r in lightning_results}
 
     # 6. Standard reef overlap retrieval (request extra to cover dedup)

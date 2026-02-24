@@ -140,7 +140,7 @@ class TestChunkStorage:
             matched_words=5,
             top_reef_id=42,
             top_reef_name="botanical classification systems",
-            arch_scores=[1.0, 0.5, 0.3, 0.1, 0.0],
+            arch_scores=[1.0, 0.5, 0.3, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
             top_reefs=[
                 (42, "botanical classification systems", 5.0, 3.0, 4),
                 (17, "animal body structures", 3.0, 2.0, 3),
@@ -190,7 +190,7 @@ class TestReefOverlapSearch:
             matched_words=4,
             top_reef_id=42,
             top_reef_name="botanical classification systems",
-            arch_scores=[2.0, 0.5, 0.3, 0.1, 0.0],
+            arch_scores=[2.0, 0.5, 0.3, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
             top_reefs=[
                 (42, "botanical classification systems", 5.0, 3.0, 4),
                 (17, "animal body structures", 3.0, 2.0, 3),
@@ -231,7 +231,7 @@ class TestReefOverlapSearch:
             matched_words=3,
             top_reef_id=42,
             top_reef_name="reef A",
-            arch_scores=[1.0, 0.5, 0.3, 0.1, 0.0],
+            arch_scores=[1.0, 0.5, 0.3, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
             top_reefs=[
                 (42, "reef A", 5.0, 3.0, 4),
                 (17, "reef B", 3.0, 2.0, 3),
@@ -269,7 +269,7 @@ class TestReefOverlapSearch:
             matched_words=1,
             top_reef_id=42,
             top_reef_name="reef A",
-            arch_scores=[1.0, 0.5, 0.3, 0.1, 0.0],
+            arch_scores=[1.0, 0.5, 0.3, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
             top_reefs=[(42, "reef A", 5.0, 3.0, 4)],
             top_islands=[],
             section_index=0,
@@ -299,7 +299,7 @@ class TestReefOverlapSearch:
             matched_words=1,
             top_reef_id=42,
             top_reef_name="reef",
-            arch_scores=[1.0, 0.5, 0.3, 0.1, 0.0],
+            arch_scores=[1.0, 0.5, 0.3, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
             top_reefs=[(42, "reef", 5.0, 3.0, 4)],
             top_islands=[],
             section_index=0,
@@ -317,7 +317,7 @@ class TestReefOverlapSearch:
             matched_words=1,
             top_reef_id=42,
             top_reef_name="reef",
-            arch_scores=[1.0, 0.5, 0.3, 0.1, 0.0],
+            arch_scores=[1.0, 0.5, 0.3, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
             top_reefs=[(42, "reef", 5.0, 3.0, 4)],
             top_islands=[],
             section_index=0,
@@ -403,12 +403,12 @@ class TestCustomWords:
         storage.insert_custom_word(
             word="alpha", word_hash=100, word_id=10,
             specificity=2, idf_q=5, n_occurrences=3,
-            reef_entries=[(42, 0, 0.9)],
+            reef_entries=[(42, 4500, 0.9)],
         )
         storage.insert_custom_word(
             word="beta", word_hash=200, word_id=20,
             specificity=1, idf_q=8, n_occurrences=4,
-            reef_entries=[(17, 0, 0.7), (99, 0, 0.3)],
+            reef_entries=[(17, 3500, 0.7), (99, 1500, 0.3)],
         )
         vocab = storage.load_custom_vocabulary()
         assert len(vocab) == 2
@@ -416,6 +416,9 @@ class TestCustomWords:
         assert vocab[1]["word"] == "beta"
         assert len(vocab[0]["reef_associations"]) == 1
         assert len(vocab[1]["reef_associations"]) == 2
+        # Verify reef_weights are included
+        assert vocab[0]["reef_weights"] == [(42, 4500)]
+        assert vocab[1]["reef_weights"] == [(17, 3500), (99, 1500)]
 
 
 class TestChunkCustomWords:
@@ -428,7 +431,7 @@ class TestChunkCustomWords:
             sentence_count=1, confidence=3.0, coverage=0.8,
             matched_words=4, top_reef_id=42,
             top_reef_name="reef A",
-            arch_scores=[1.0, 0.5, 0.3, 0.1, 0.0],
+            arch_scores=[1.0, 0.5, 0.3, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
             top_reefs=[(42, "reef A", 5.0, 3.0, 4)],
             top_islands=[], section_index=0,
         )
@@ -438,7 +441,7 @@ class TestChunkCustomWords:
             sentence_count=1, confidence=2.5, coverage=0.7,
             matched_words=3, top_reef_id=17,
             top_reef_name="reef B",
-            arch_scores=[0.5, 1.0, 0.3, 0.1, 0.0],
+            arch_scores=[0.5, 1.0, 0.3, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
             top_reefs=[(17, "reef B", 4.0, 2.0, 3)],
             top_islands=[], section_index=0,
         )

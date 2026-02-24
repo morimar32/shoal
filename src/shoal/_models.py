@@ -48,7 +48,7 @@ class ChunkData:
     top_reef_id: int
     top_reef_name: str
     arch_scores: list[float]
-    top_reefs: list[tuple[int, str, float, float, int]]  # (reef_id, name, z_score, raw_bm25, n_contributing_words)
+    top_reefs: list[tuple[int, str, float, float, int]]  # (reef_id, name, z_score, raw_score, n_contributing_words)
     top_islands: list[tuple[int, str, float, int]]  # (island_id, name, aggregate_z, n_contributing_reefs)
     section_index: int = 0     # index into section list, resolved to section_id during storage
     metadata: dict = field(default_factory=dict)
