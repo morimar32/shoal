@@ -204,6 +204,8 @@ def _cmd_search(args: argparse.Namespace) -> None:
     """Search for relevant chunks."""
     tags = args.tags.split(",") if args.tags else None
 
+    max_per_doc = args.max_per_doc if args.max_per_doc > 0 else None
+
     with Engine(db_path=args.db) as engine:
         response = engine.search(
             args.query,
@@ -211,6 +213,7 @@ def _cmd_search(args: argparse.Namespace) -> None:
             tags=tags,
             min_confidence=args.min_confidence,
             include_scores=args.scores,
+            max_per_doc=max_per_doc,
         )
         _print_search_results(response, args.query, args.scores)
 
@@ -473,6 +476,10 @@ def main(argv: list[str] | None = None) -> None:
     p_search.add_argument("--tags", help="Filter by comma-separated tags")
     p_search.add_argument("--min-confidence", type=float, help="Minimum chunk confidence")
     p_search.add_argument("--scores", action="store_true", help="Show shared reef details")
+    p_search.add_argument(
+        "--max-per-doc", type=int, default=3,
+        help="Max chunks per document in results (default: 3, 0 to disable)",
+    )
 
     # explain
     p_explain = subparsers.add_parser("explain", help="Explain how a query is scored")

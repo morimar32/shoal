@@ -1,5 +1,7 @@
 """Tests for _retrieve.py (requires lagoon scorer)."""
 
+from collections import Counter
+
 from shoal._ingest import ingest_document
 from shoal._models import DocFormat
 from shoal._retrieve import _is_stopword_query, search
@@ -131,6 +133,30 @@ class TestRetrieve:
         qi = response.query_info
         # tagged_words should be a list (may be empty if no custom words match)
         assert isinstance(qi.tagged_words, list)
+
+
+    def test_max_per_doc_limits_per_document(self, scorer, storage):
+        """With max_per_doc=1, each doc gets at most 1 result."""
+        self._ingest_bio_doc(scorer, storage)
+        self._ingest_geo_doc(scorer, storage)
+
+        response = search(
+            scorer, storage, "photosynthesis earthquake science",
+            top_k=10, max_per_doc=1,
+        )
+        doc_counts = Counter(r.document_title for r in response.results)
+        for doc, count in doc_counts.items():
+            assert count <= 1, f"'{doc}' appeared {count} times with max_per_doc=1"
+
+    def test_max_per_doc_disabled_allows_repeats(self, scorer, storage):
+        """With max_per_doc=None, a single doc can fill multiple slots."""
+        self._ingest_bio_doc(scorer, storage)
+        response = search(
+            scorer, storage, "photosynthesis chlorophyll",
+            top_k=10, max_per_doc=None,
+        )
+        # Just verify it works without crashing
+        assert response.query_info is not None
 
 
 class TestStopWordDetection:

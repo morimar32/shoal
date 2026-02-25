@@ -30,6 +30,26 @@ def _is_stopword_query(query: str) -> bool:
     return all(w in STOP_WORDS for w in words)
 
 
+def _apply_doc_diversity(
+    results: list[SearchResult],
+    top_k: int,
+    max_per_doc: int | None,
+) -> list[SearchResult]:
+    """Filter results so no single document exceeds max_per_doc entries."""
+    if max_per_doc is None or max_per_doc <= 0:
+        return results[:top_k]
+    doc_counts: dict[int, int] = {}
+    filtered: list[SearchResult] = []
+    for r in results:
+        count = doc_counts.get(r.document_id, 0)
+        if count < max_per_doc:
+            filtered.append(r)
+            doc_counts[r.document_id] = count + 1
+            if len(filtered) >= top_k:
+                break
+    return filtered
+
+
 def search(
     scorer: ReefScorer,
     storage: Storage,
@@ -40,6 +60,7 @@ def search(
     min_confidence: float | None = None,
     include_scores: bool = False,
     enable_lightning_rod: bool = True,
+    max_per_doc: int | None = 3,
 ) -> SearchResponse:
     """Score a query with lagoon and retrieve matching chunks via reef overlap.
 
@@ -143,8 +164,11 @@ def search(
                 )
             lightning_chunk_ids = {r.chunk_id for r in lightning_results}
 
-    # 6. Standard reef overlap retrieval (request extra to cover dedup)
-    standard_top_k = top_k + len(lightning_chunk_ids)
+    # 6. Standard reef overlap retrieval (request extra to cover dedup + diversity filtering)
+    if max_per_doc is not None and max_per_doc > 0:
+        standard_top_k = max(top_k * 3, top_k + len(lightning_chunk_ids))
+    else:
+        standard_top_k = top_k + len(lightning_chunk_ids)
     standard_results = storage.search_by_reef_overlap(
         query_reefs,
         top_k=standard_top_k,
@@ -164,9 +188,9 @@ def search(
             if sr.chunk_id not in merged_map:
                 merged_map[sr.chunk_id] = sr
 
-        # Re-sort by match_score, truncate to top_k
+        # Re-sort by match_score, apply diversity filter, truncate to top_k
         merged = sorted(merged_map.values(), key=lambda r: r.match_score, reverse=True)
-        results = merged[:top_k]
+        results = _apply_doc_diversity(merged, top_k, max_per_doc)
 
         # 8. If include_scores: fetch shared_reefs for lightning results that lack them
         if include_scores:
@@ -174,7 +198,7 @@ def search(
                 if r.chunk_id in lightning_chunk_ids and not r.shared_reefs:
                     r.shared_reefs = storage._get_shared_reefs(r.chunk_id, query_reefs)
     else:
-        results = standard_results[:top_k]
+        results = _apply_doc_diversity(standard_results, top_k, max_per_doc)
 
     # 9. Build query info with tagged_words
     query_info = _build_query_info(result, total_words, tagged_words=tagged_words)

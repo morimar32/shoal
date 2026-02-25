@@ -137,6 +137,7 @@ class Engine:
         min_confidence: float | None = None,
         include_scores: bool = False,
         enable_lightning_rod: bool = True,
+        max_per_doc: int | None = 3,
     ) -> SearchResponse:
         """Search for relevant chunks."""
         return search(
@@ -148,6 +149,7 @@ class Engine:
             min_confidence=min_confidence,
             include_scores=include_scores,
             enable_lightning_rod=enable_lightning_rod,
+            max_per_doc=max_per_doc,
         )
 
     def delete_document(self, doc_id: int) -> bool:
